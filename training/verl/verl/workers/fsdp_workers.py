@@ -98,6 +98,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _get_reward_model_attention_implementation(config):
+    """Return the configured Hugging Face attention backend for a reward model."""
+    override_config = config.model.get("override_config", {}) or {}
+    return override_config.get("attn_implementation", "flash_attention_2")
+
+
 def _compute_student_topk_in_teacher_top_p_mask(
     logits: torch.Tensor,
     student_ids: torch.Tensor,
@@ -1829,6 +1835,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         from verl.utils.torch_dtypes import PrecisionType
         model_dtype_str = config.model.get("dtype", "bf16")
         model_dtype = PrecisionType.to_dtype(model_dtype_str)
+        attn_implementation = _get_reward_model_attention_implementation(config)
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1838,7 +1845,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=model_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1891,7 +1898,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):

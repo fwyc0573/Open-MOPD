@@ -22,7 +22,10 @@ from verl.utils.device import (
 )
 
 if is_cuda_available:
-    from flash_attn.bert_padding import pad_input, unpad_input
+    try:
+        from flash_attn.bert_padding import pad_input, unpad_input
+    except ImportError:
+        from verl.utils.npu_utils import pad_input, unpad_input
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import pad_input, unpad_input
 
