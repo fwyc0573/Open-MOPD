@@ -21,6 +21,12 @@ _GRM_KWARGS = {
 _GRM_KEYS = {"grm_called", "grm_pass", "grm_capped", "grm_penalty", "grm_error"}
 
 
+def _stub_transport(monkeypatch, verdict: bool | None) -> None:
+    """Stub the transport seam used by the concurrent batch judge path."""
+    response = None if verdict is None else f"<verdict>{'YES' if verdict else 'NO'}</verdict>"
+    monkeypatch.setattr(if_grm, "_request_completion", lambda *args, **kwargs: response)
+
+
 def test_parse_verdict_variants() -> None:
     assert if_grm.parse_verdict("<verdict>YES</verdict>") is True
     assert if_grm.parse_verdict("<verdict>no</verdict>") is False
@@ -83,6 +89,9 @@ def test_request_completion_disables_env_proxy_by_default(monkeypatch) -> None:
         def __init__(self) -> None:
             self.trust_env = True
 
+        def mount(self, *args, **kwargs) -> None:
+            return None
+
         def __enter__(self):
             return self
 
@@ -115,6 +124,9 @@ def test_request_completion_can_opt_into_env_proxy(monkeypatch) -> None:
     class FakeSession:
         def __init__(self) -> None:
             self.trust_env = False
+
+        def mount(self, *args, **kwargs) -> None:
+            return None
 
         def __enter__(self):
             return self
@@ -150,7 +162,7 @@ def test_grm_config_judges_all_families_by_default() -> None:
 def test_grm_keeps_think_bonus_on_semantic_fail(monkeypatch) -> None:
     # think OK + rule OK + semantic FAIL: by default the task reward (0.8) is removed
     # but the independent think-format bonus (0.2) is kept.
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     results = compute_score_batch(
         data_sources=["nemotron_if"],
@@ -171,7 +183,7 @@ def test_grm_keeps_think_bonus_on_semantic_fail(monkeypatch) -> None:
 
 def test_grm_caps_to_zero_when_no_think_format(monkeypatch) -> None:
     # no think + rule OK + semantic FAIL: think bonus is 0, so the floor is 0.0.
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     results = compute_score_batch(
         data_sources=["nemotron_if"],
@@ -189,7 +201,7 @@ def test_grm_caps_to_zero_when_no_think_format(monkeypatch) -> None:
 
 def test_grm_hard_zero_when_keep_think_disabled(monkeypatch) -> None:
     # grm_keep_think_on_fail=False restores the aggressive hard-0 behavior.
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     results = compute_score_batch(
         data_sources=["nemotron_if"],
@@ -207,7 +219,7 @@ def test_grm_hard_zero_when_keep_think_disabled(monkeypatch) -> None:
 
 
 def test_grm_keeps_score_when_judge_passes(monkeypatch) -> None:
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *args, **kwargs: True)
+    _stub_transport(monkeypatch, True)
 
     results = compute_score_batch(
         data_sources=["nemotron_if"],
@@ -284,7 +296,7 @@ def test_grm_skips_official_eval_rows(monkeypatch) -> None:
 
 
 def test_grm_keys_aligned_across_mixed_batch(monkeypatch) -> None:
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     results = compute_score_batch(
         data_sources=["nemotron_if", "nemotron_if"],
@@ -303,7 +315,7 @@ def test_grm_keys_aligned_across_mixed_batch(monkeypatch) -> None:
 
 
 def test_grm_judges_previously_exempt_family_by_default(monkeypatch) -> None:
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     extra = dict(_KEYWORDS_EXTRA)
     extra["family"] = "length_constraints"  # used to be exempt; now judged by default
@@ -322,7 +334,7 @@ def test_grm_judges_previously_exempt_family_by_default(monkeypatch) -> None:
 
 
 def test_grm_respects_explicit_family_restriction(monkeypatch) -> None:
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: False)
+    _stub_transport(monkeypatch, False)
 
     extra = dict(_KEYWORDS_EXTRA)
     extra["family"] = "length_constraints"
@@ -341,7 +353,7 @@ def test_grm_respects_explicit_family_restriction(monkeypatch) -> None:
 
 
 def test_grm_fail_mode_open_vs_closed(monkeypatch) -> None:
-    monkeypatch.setattr(if_grm, "judge_semantic_pass", lambda *a, **k: None)  # transport failure
+    _stub_transport(monkeypatch, None)
 
     open_results = compute_score_batch(
         data_sources=["nemotron_if"],

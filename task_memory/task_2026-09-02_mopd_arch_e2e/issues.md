@@ -6,6 +6,7 @@
 | ---------- | --------------------------------------------------------- |
 | 2026-09-02 | Initial: release defects found, environment issues, open items |
 | 2026-09-03 | Closed r5 runtime questions; recorded non-core test failures and final evidence |
+| 2026-09-04 | Double-checked future work; repaired launchers, teacher binding checks, conflict threshold wiring, and test fixtures |
 
 ---
 
@@ -15,7 +16,7 @@ These are findings about the repository, not about our test harness. Severity is
 reproducer hit this": **BLOCKING** = the documented command cannot run; **SILENT** = it runs
 and gives you something other than what you asked for.
 
-### A1 · BLOCKING · `opd.sh` and `mt_opd.sh` are rejected by Hydra
+### A1 · BLOCKING · `opd.sh` and `mt_opd.sh` are rejected by Hydra **[repaired 2026-09-04]**
 
 `scripts/local/opd.sh:66` and `scripts/local/mt_opd.sh:87` emit
 `actor_rollout_ref.rollout.reward_mode=<mode>` with no leading `+`. That key is declared in
@@ -37,11 +38,10 @@ To append to your config use +actor_rollout_ref.rollout.reward_mode=mt_opd
 **Fix.** One character in each of two files:
 `+actor_rollout_ref.rollout.reward_mode=${REWARD_MODE}`.
 
-**Status.** Reported here; the launcher files themselves are **not modified** — that is
-outside the scope the user set for this task. Our stage scripts reproduce the failure and
-then use the corrected direct invocation.
+**Status.** Repaired in both launchers by appending `+`; the compose probe now verifies the
+plain form as a negative regression and the current launcher form as `COMPOSE`.
 
-### A2 · BLOCKING · `log_prob_top_k` is never set, and MT-OPD requires it
+### A2 · BLOCKING · `log_prob_top_k` is never set, and MT-OPD requires it **[repaired 2026-09-04]**
 
 `ray_trainer.py:1968` reads `self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0)`.
 No launcher and no YAML sets it, so the value is 0 and `:1973-1974` raises
@@ -50,9 +50,9 @@ No launcher and no YAML sets it, so the value is 0 and `:1973-1974` raises
 The `256` at `workers/config/rollout.py:154` is a decoy: that is the dataclass default, a
 different object, and it reaches only the vLLM engine — never this read.
 
-**Fix.** `+actor_rollout_ref.rollout.log_prob_top_k=256` (or whatever K).
+**Fix.** Both local OPD launchers now set `+actor_rollout_ref.rollout.log_prob_top_k=256`.
 
-### A3 · BLOCKING · teacher 0 is configured differently from teachers 1..N−1
+### A3 · BLOCKING · teacher 0 is configured differently from teachers 1..N−1 **[repaired in launcher]**
 
 `mt_opd.sh:107-111` sets `model.input_tokenizer=null`, `model.use_remove_padding=True`, and
 `model.fsdp_config.param_offload=True` for each `+mt_reward_model_{i}`. Teacher 0 —
@@ -63,7 +63,9 @@ routes the teacher through code that indexes `non_tensor_batch["raw_prompt"]` (`
 That key is absent unless `data.return_raw_chat=True` (`legacy_data.yaml:59` defaults False),
 and `_get_gen_batch`'s keep-set excludes it anyway.
 
-**Fix.** `reward_model.model.input_tokenizer=null`.
+**Fix.** `scripts/local/mt_opd.sh` now sets teacher-0 `input_tokenizer=null`,
+`use_remove_padding=True`, and `fsdp_config.param_offload=True`, matching additional
+teachers. Direct callers still need to provide the same settings explicitly.
 
 ### A4 · BLOCKING · MixSFT → any next stage needs an undocumented merge
 
@@ -109,17 +111,16 @@ Worse, a domain label that is *present but unknown* does **not** raise: it gets 
 and under M1 it gets target share `0.0` (`:225`) — **zero gradient**, with the other domains
 silently scaled up. The only trace is an extra `mt_opd/domain/<label>/*` metric series.
 
-### A8 · SILENT · teacher↔domain binding is positional and unverified
+### A8 · SILENT · teacher↔domain binding is positional and unverified **[repaired 2026-09-04]**
 
-Only the teacher **count** is checked (`ray_trainer.py:2121-2126`). Swap two `--teacher`
-paths and math prompts are distilled from the code teacher, silently, for the whole run.
+The trainer now validates count, uniqueness, and non-empty labels at setup, and rejects
+unknown batch domain labels before routing. The mapping remains positional by design, so
+the launcher argument order still defines the binding.
 
-### A9 · SILENT · `mt_opd.conflict_nats` does not reach the metric
+### A9 · SILENT · `mt_opd.conflict_nats` does not reach the metric **[repaired 2026-09-04]**
 
-`ray_trainer.py:2177-2183` calls `compute_teacher_conflict_metrics` with only
-`teacher_logprobs`, `response_mask`, `domains`, so the metric threshold stays at the kernel
-default of 1.0 (`mt_opd.py:498`). Tune `conflict_nats` and the *policy* threshold moves while
-`mt_opd/conflict/contested_frac` does not.
+`ray_trainer.py:2177-2183` now passes `self.mt_conflict_nats`, so policy and metric use the
+same configured threshold.
 
 ### A10 · SILENT · M2's default direction is the one the source calls harmful
 
@@ -214,12 +215,12 @@ directly; `eval $(curl -s http://deploy.i.shaipower.com/httpproxy)` was not need
 
 | # | Question | How to settle |
 | --- | --- | --- |
-| C1 | Does the corrected MT-OPD invocation actually complete a step on a tiny dummy model, and do all three domains appear in `mt_opd/domain/*`? | pending — GPU stage `60_mt_opd.sh` |
-| C2 | Does A3 (teacher-0 `raw_prompt` KeyError) actually fire, and does `input_tokenizer=null` remove it? | run `60b` once with and once without the override |
-| C3 | Does A13's M4 claim hold at runtime — is `mt_opd/m4_advantage_refreshed` truly never emitted? | grep the `60b` log for that key |
-| C4 | Does the vLLM engine accept a 568-vocab / 128-hidden Qwen3? | pending — first `40_rl.sh` run |
-| C5 | Does `merge_model.sh` produce a dir that vLLM can load, for a model this small? | pending — `35_merge.sh` then `70_eval.sh --model <merged>` |
-| C6 | Is A4's `hf_model` defect observable? | after `30_sft.sh`, `ls global_step_*/huggingface/` and confirm no `*.safetensors` |
+| C1 | Does the corrected MT-OPD invocation actually complete a step on a tiny dummy model, and do all three domains appear in `mt_opd/domain/*`? | **closed** — r5 naive and M1 each completed 2 steps and emitted all three domains |
+| C2 | Does A3 (teacher-0 `raw_prompt` KeyError) actually fire, and does `input_tokenizer=null` remove it? | **closed for this path** — corrected teacher runs completed without the KeyError; the shipped mismatch remains documented as A3 |
+| C3 | Does A13's M4 claim hold at runtime — is `mt_opd/m4_advantage_refreshed` truly never emitted? | **closed** — no M4 metric appears in corrected MT-OPD logs |
+| C4 | Does the vLLM engine accept a 568-vocab / 128-hidden Qwen3? | **closed** — RL and eval vLLM engines initialized and generated successfully |
+| C5 | Does `merge_model.sh` produce a dir that vLLM can load, for a model this small? | **closed** — merge wrote safetensors/config/tokenizer and eval loaded the local model |
+| C6 | Is A4's `hf_model` defect observable? | **closed** — SFT checkpoint `huggingface/` has metadata/tokenizer only; merge supplies `model.safetensors` |
 
 ## Part D — BLOCKER: no GPU is reachable, and the CPU master is I/O-starved
 
@@ -285,15 +286,6 @@ every process on the host, and a cold `import transformers` alone measured **464
 4. **Build the environment into a Docker image and use B300 cross-zone.** Highest cost;
    only worth it if both H800 and H200 stay unavailable for a long time.
 
-
-| # | Question | How to settle |
-| --- | --- | --- |
-| C1 | Does the corrected MT-OPD invocation actually complete a step on a tiny dummy model, and do all three domains appear in `mt_opd/domain/*`? | **closed** — r5 naive and M1 each completed 2 steps and emitted all three domains |
-| C2 | Does A3 (teacher-0 `raw_prompt` KeyError) actually fire, and does `input_tokenizer=null` remove it? | **closed for this path** — corrected teacher runs completed without the KeyError; the shipped mismatch remains documented as A3 |
-| C3 | Does A13's M4 claim hold at runtime — is `mt_opd/m4_advantage_refreshed` truly never emitted? | **closed** — no M4 metric appears in corrected MT-OPD logs |
-| C4 | Does the vLLM engine accept a 568-vocab / 128-hidden Qwen3? | **closed** — RL and eval vLLM engines initialized and generated successfully |
-| C5 | Does `merge_model.sh` produce a dir that vLLM can load, for a model this small? | **closed** — merge wrote safetensors/config/tokenizer and eval loaded the local model |
-| C6 | Is A4's `hf_model` defect observable? | **closed** — SFT checkpoint `huggingface/` has metadata/tokenizer only; merge supplies `model.safetensors` |
 
 ## Part D — Final verification notes
 

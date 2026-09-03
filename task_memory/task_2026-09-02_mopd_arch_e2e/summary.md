@@ -5,6 +5,7 @@
 | Date       | Summary of Changes |
 | ---------- | ------------------ |
 | 2026-09-03 | Archived the architecture deliverables, corrected E2E implementation, and final validation evidence. |
+| 2026-09-04 | Archived double-check results and scoped repairs for launcher, MT-OPD, GRM, and capability follow-ups. |
 
 ## Task Overview
 
@@ -26,13 +27,18 @@ download was involved.
 * `/data/ycfeng/Open-MOPD/task_memory/task_2026-09-02_mopd_arch_e2e/review.md`
 * `/data/ycfeng/Open-MOPD/task_memory/task_2026-09-02_mopd_arch_e2e/lessons.md`
 * `/data/ycfeng/Open-MOPD/task_memory/task_2026-09-02_mopd_arch_e2e/future.md`
+* `/data/ycfeng/Open-MOPD/experiments/tests/test_if_rl_grm.py`
+* `/data/ycfeng/Open-MOPD/experiments/analysis/capability_subspace.py`
 
 ## Validation Status
 
 | Gate | Outcome | Metrics |
 | ---- | ------- | ------- |
 | Open-MOPD tests | PASS | `132 passed` |
-| Focused code regressions | PASS | `5 passed` |
+| Focused code regressions | PASS | `5 passed` (attention/entropy) |
+| Future-work MT-OPD regressions | PASS | `60 passed` |
+| Future-work GRM regressions | PASS | `17 passed` |
+| Future-work capability regressions | PASS | `69 passed` |
 | Config probe | PASS | `0` unexpected outcomes |
 | SFT | PASS | 6 steps; train loss `6.4359403 -> 5.8885908`; val loss `6.3142653 -> 5.7854004` |
 | Merge | PASS | `model.safetensors` written, `885032` bytes |
@@ -44,7 +50,9 @@ download was involved.
 
 ## Open Items/Future Extensions
 
-The shipped OPD/MT-OPD launchers still need their Hydra `+` fixes in a future release.
-The verifier has no `dummy_math` scorer, so eval correctness is limited to artifact and
-schema validation. The unrelated repo-suite failures remain documented in the test
-report and are intentionally outside this task's MOPD scope.
+The local OPD/MT-OPD launchers now contain the Hydra `+` and `log_prob_top_k` fixes, and
+MT-OPD validates positional teacher/domain binding before routing. M2's `divide` default
+remains unchanged because switching to the measured-preferred `multiply` changes training
+semantics and needs an explicit migration decision. The verifier still has no `dummy_math`
+scorer, so the offline eval records artifact/schema evidence only. The unrelated repo-suite
+failures remain documented in the original test report.

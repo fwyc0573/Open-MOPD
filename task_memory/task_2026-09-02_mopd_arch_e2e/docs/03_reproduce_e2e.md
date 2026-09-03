@@ -5,6 +5,7 @@
 | Date       | Summary of Changes |
 | ---------- | ------------------ |
 | 2026-09-03 | Added the verified H800 reproduction procedure, offline dummy assets, stage commands, evidence locations, and known release-test failures. |
+| 2026-09-04 | Updated OPD/MT-OPD launcher commands after repairing Hydra extension keys and teacher-0 settings. |
 
 This guide reproduces the high-fidelity single-GPU flow used for this task. It uses
 four locally synthesized `Qwen3ForCausalLM` models and never downloads Hugging Face
@@ -84,9 +85,10 @@ The driver order is:
 -> 60_mt_opd.sh (MT_MODE=naive) -> 60_mt_opd.sh (MT_MODE=m1) -> 70_eval.sh
 ```
 
-The corrected OPD/MT-OPD invocations append the undeclared Hydra keys with `+` and set
-`log_prob_top_k=16`. The shipped launchers are executed first and are expected to fail
-at Hydra composition; this preserves the release defect as evidence.
+The OPD/MT-OPD launchers now append the undeclared Hydra keys with `+`, set
+`log_prob_top_k=256`, and align teacher-0 tokenizer/remove-padding/offload settings.
+The E2E scripts retain a plain `reward_mode` composition negative case so the original
+Hydra failure remains regression evidence without treating the repaired launcher as broken.
 
 ## 4. Inspect evidence
 

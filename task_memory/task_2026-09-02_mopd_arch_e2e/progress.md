@@ -177,6 +177,46 @@ regressions for the attention backend and entropy layout report `5 passed` local
   tests exit `0` (`5 passed`); the core E2E stages exit `0`, while the eight unrelated
   repo-test failures remain explicitly reported.
 
+## 2026-09-04 — future-work double-check and scoped repairs
+
+### F12. Launcher, teacher binding, and conflict threshold
+
+* **Motivation:** shipped OPD/MT-OPD launchers used undeclared Hydra keys without `+`,
+  omitted `log_prob_top_k`, and left teacher-0 settings inconsistent with additional
+  teachers; the trainer also failed to enforce positional domain contracts and dropped
+  `conflict_nats` at metric call time.
+* **Expectation:** current launchers compose, teacher configuration is symmetric, invalid
+  positional/domain inputs fail before routing, and policy/metric thresholds agree.
+* **Method:** appended runtime keys in both launchers; aligned teacher-0 tokenizer,
+  remove-padding, and FSDP offload settings; added `_validate_mt_teacher_binding` and
+  unknown-domain rejection in `ray_trainer.py`; passed `self.mt_conflict_nats` to
+  `compute_teacher_conflict_metrics`.
+* **Result:** launcher dry-run contains `+reward_mode` and `+log_prob_top_k=256`; Hydra
+  probe reports `unexpected outcomes: 0`; MT-OPD tests pass `60`; invalid plain reward
+  mode remains a deliberate negative regression.
+
+### F13. GRM and capability-subspace test correctness
+
+* **Motivation:** GRM tests either supplied a FakeSession without `.mount()` or patched a
+  helper bypassed by concurrent fan-out, causing DNS retries and false failures; explicit
+  capability directions used randomized SVD against an exact-SVD reference.
+* **Expectation:** tests isolate the actual transport seam and explicit directions remain
+  deterministic across calls.
+* **Method:** added FakeSession `.mount()`, stubbed `_request_completion` in semantic tests,
+  and switched small explicit direction construction to deterministic `torch.linalg.svd`.
+* **Result:** `test_if_rl_grm.py` passes `17`; `test_capability_subspace.py` passes `69`.
+
+### F14. Deferred decisions
+
+* **Motivation:** M2 `reward_scale_direction` has a real outcome-changing default choice;
+  `dummy_math` lacks a production scorer by design.
+* **Expectation:** preserve compatibility while recording evidence-based recommendations.
+* **Method:** kept default `divide`, documented explicit `multiply` recommendation and the
+  need for a migration decision; left scorer registry unchanged and retained the existing
+  `unknown_dataset` offline evidence.
+* **Result:** no unapproved cross-cutting behavior change; both items are recorded in
+  `future.md` as deferred.
+
 ## Artifacts produced so far
 
 ```

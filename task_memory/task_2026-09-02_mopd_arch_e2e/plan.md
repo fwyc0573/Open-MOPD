@@ -5,6 +5,7 @@
 | Date       | Summary of Changes                                                       |
 | ---------- | ------------------------------------------------------------------------ |
 | 2026-09-02 | Initial plan; scope fixed by user decision (GPU-first high-fidelity E2E) |
+| 2026-09-04 | Added continuation plan for evidence-led future-work double-check and scoped repairs. |
 
 ## Scope (fixed by user decision 2026-09-02)
 
@@ -36,6 +37,17 @@ S0 (scout repo + env)  -- DONE
 
 Arrow chain: `S0 -> {S1, S2} ; S2 -> S3 -> S4 -> S5 ; S1 -> S6 ; {S5, S6} -> S7`
 S1 runs in parallel with S2/S3/S4.
+
+## Continuation — future-work double-check (2026-09-04)
+
+Dependency map: `F0 (read task records) -> {F1 launcher repair, F2 teacher/binding repair, F3 GRM/capability repair} -> F4 conflict wiring and M2 decision -> F5 docs/tests/archive`.
+
+`F1`, `F2`, and `F3` are independent source areas and may run in parallel after `F0`;
+`F4` consumes the teacher/metric evidence; `F5` waits for every verification result.
+
+Acceptance: every future item has a verdict tied to a file/runtime observation; fixes stay
+within local launcher/test/trainer boundaries; behavior-changing defaults and production
+scorer additions remain explicitly deferred when evidence does not settle the decision.
 
 ## S1 — Architecture deep-read (in flight, workflow `wf_4fa2f58c-0e7`)
 

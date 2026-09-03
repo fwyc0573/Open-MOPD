@@ -2,13 +2,9 @@
 # Open-MOPD E2E — Step 50: single-teacher on-policy distillation (OPD).
 #
 # Two parts, both recorded:
-#   50a  the SHIPPED launcher, scripts/local/opd.sh --run. Expected to FAIL at Hydra
-#        composition: opd.sh:66 emits `actor_rollout_ref.rollout.reward_mode=opd_kl`
-#        with no leading '+', while that key is declared in no YAML under
-#        verl/trainer/config/ and is absent from RolloutConfig
-#        (verl/workers/config/rollout.py). Hydra rejects a plain override of an
-#        undeclared key. Confirmed by 15_config_probe.py.
-#   50b  the CORRECTED direct invocation, so the algorithm path actually runs.
+#   50a  the repaired local launcher, scripts/local/opd.sh --run.
+#   50b  the equivalent corrected direct invocation, so the algorithm path remains
+#        independently reproducible.
 #
 # What makes it distillation rather than RL:
 #   algorithm.adv_estimator=token_reward_direct
@@ -37,7 +33,7 @@ LOG_A="$LOGS/50a_opd_shipped_launcher.log"
 LOG_B="$LOGS/50b_opd_corrected.log"
 mkdir -p "$OUT/checkpoints"
 
-banner "50a — SHIPPED scripts/local/opd.sh --run (expected: Hydra rejects plain reward_mode)"
+banner "50a — REPAIRED scripts/local/opd.sh --run"
 set +e
 env PYTHON_BIN="$PY" TRAIN_BATCH_SIZE="$TRAIN_BS" \
     MAX_PROMPT_LENGTH="$MAX_PROMPT_LEN" MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LEN" \
@@ -48,8 +44,7 @@ env PYTHON_BIN="$PY" TRAIN_BATCH_SIZE="$TRAIN_BS" \
         --output "$RUNS/opd-shipped" --gpus "$GPUS" 2>&1 | tee "$LOG_A"
 rc_a=${PIPESTATUS[0]}
 set -e
-echo "[50a] exit=$rc_a  (nonzero is the documented defect, not a test failure)"
-grep -m2 -A2 "Could not override\|ConfigCompositionException" "$LOG_A" || echo "[50a] no composition error seen — re-check the finding"
+echo "[50a] repaired launcher exit=$rc_a"
 
 banner "50b — CORRECTED direct invocation (reward_mode=opd_kl, top_k=$TOP_K)"
 cd "$REPO/training"

@@ -534,6 +534,15 @@ def test_top_rank_retained_matches_the_explicit_projection() -> None:
         assert cheap >= explicit - 1e-6, "exact projection cannot capture less"
 
 
+def test_top_rank_directions_are_deterministic() -> None:
+    """Explicit directions must be stable because they are compared with exact SVD energy."""
+    g = torch.Generator().manual_seed(53)
+    delta = torch.randn(20, 14, generator=g)
+    first = top_rank_directions(delta, 3)
+    second = top_rank_directions(delta, 3)
+    torch.testing.assert_close(first.abs(), second.abs(), atol=1e-6, rtol=1e-6)
+
+
 def test_top_rank_retained_is_one_at_full_rank() -> None:
     g = torch.Generator().manual_seed(51)
     delta = torch.randn(9, 6, generator=g)

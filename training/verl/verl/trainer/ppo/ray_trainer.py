@@ -92,6 +92,19 @@ def _pop_direct_opd_rollout_options(config) -> dict:
     return options
 
 
+def _validate_mt_teacher_binding(teacher_domains: list[str], n_additional_teachers: int) -> None:
+    """Validate the positional teacher index contract before workers start."""
+    expected = n_additional_teachers + 1
+    if len(teacher_domains) != expected:
+        raise ValueError(
+            f"MT-OPD teacher count ({expected}) must match teacher_domains ({len(teacher_domains)})"
+        )
+    if any(not str(domain).strip() for domain in teacher_domains):
+        raise ValueError("MT-OPD teacher_domains must contain non-empty labels")
+    if len(set(map(str, teacher_domains))) != len(teacher_domains):
+        raise ValueError("MT-OPD teacher_domains must be unique")
+
+
 def _ensure_validation_data_source(batch: DataProto) -> None:
     """Alias formal-eval ``dataset`` labels to VERL's routing key.
 
@@ -664,6 +677,7 @@ class RayPPOTrainer:
             self.mt_domain_weighting: str = str(OmegaConf.select(mt_opd_cfg, "domain_weighting") or "domain_routing")
             if not self.mt_teacher_domains:
                 raise ValueError("reward_mode=mt_opd requires mt_opd.teacher_domains to be set")
+            _validate_mt_teacher_binding(self.mt_teacher_domains, self.mt_n_additional)
             # M1: target *gradient* share per domain. Prompt weights cannot set this --
             # with response lengths spanning 32x, token share (and thus gradient share
             # under token-mean) is nearly independent of prompt share. Unset means the
@@ -2112,6 +2126,14 @@ class RayPPOTrainer:
                                         "reward_mode=mt_opd requires non_tensor_batch['domain'] "
                                         "on the training batch"
                                     )
+                                unknown_domains = sorted(
+                                    set(map(str, domains)) - set(self.mt_teacher_domains)
+                                )
+                                if unknown_domains:
+                                    raise ValueError(
+                                        "reward_mode=mt_opd found domain labels absent from "
+                                        f"mt_opd.teacher_domains: {unknown_domains}"
+                                    )
 
                                 teacher_logps: list[torch.Tensor] = [batch.batch["teacher_on_student_log_probs"]]
                                 i = 1
@@ -2179,6 +2201,7 @@ class RayPPOTrainer:
                                         teacher_logprobs=teacher_logps,
                                         response_mask=response_mask,
                                         domains=domains,
+                                        conflict_nats=self.mt_conflict_nats,
                                     )
                                 )
 

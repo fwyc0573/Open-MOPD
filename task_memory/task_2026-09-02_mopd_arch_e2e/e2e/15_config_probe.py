@@ -6,11 +6,8 @@ Ray has booted, vLLM has allocated KV cache, and four FSDP models have loaded. T
 probe composes the exact same override lists with hydra.compose() and no execution,
 so a key error costs a second instead of ten minutes of H800 time.
 
-It also pins down the launcher defect that matters most: scripts/local/opd.sh:66 and
-scripts/local/mt_opd.sh:87 emit `actor_rollout_ref.rollout.reward_mode=<mode>` with NO
-leading '+', while that key is declared in no YAML under verl/trainer/config/ and is
-absent from the RolloutConfig dataclass. Hydra rejects a plain override of an
-undeclared key, so those two launchers cannot run as released.
+It also verifies the launcher contract: reward_mode and log_prob_top_k are runtime
+extension keys, so the local launchers must append them with a leading '+'.
 
 Usage:
     python 15_config_probe.py [--assets DIR]
@@ -154,9 +151,9 @@ def build_cases(a: Path):
         True,
     ))
 
-    # --- OPD: the shipped form vs the corrected form
+    # --- OPD: retain the invalid plain form as a negative regression and verify the launcher form.
     cases.append((
-        "opd AS SHIPPED (opd.sh:66, plain reward_mode)",
+        "opd invalid plain reward_mode (negative regression)",
         "ppo_trainer",
         ["algorithm.adv_estimator=token_reward_direct", *common_ppo(a),
          "actor_rollout_ref.rollout.reward_mode=opd_kl", *rm_common,
@@ -164,7 +161,7 @@ def build_cases(a: Path):
         False,  # expected to FAIL — this is the launcher defect
     ))
     cases.append((
-        "opd CORRECTED (+reward_mode, +log_prob_top_k)",
+        "opd launcher form (+reward_mode, +log_prob_top_k)",
         "ppo_trainer",
         ["algorithm.adv_estimator=token_reward_direct", *common_ppo(a),
          "+actor_rollout_ref.rollout.reward_mode=opd_kl",
@@ -173,8 +170,8 @@ def build_cases(a: Path):
         True,
     ))
 
-    # --- MT-OPD: the shipped form vs the corrected form
-    mt_shipped = [
+    # --- MT-OPD: retain the invalid plain form as a negative regression and verify the launcher form.
+    mt_invalid = [
         "algorithm.adv_estimator=token_reward_direct", *common_ppo(a),
         "actor_rollout_ref.rollout.reward_mode=mt_opd",
         "reward_model.enable=True", f"reward_model.model.path={t_math}",
@@ -182,7 +179,7 @@ def build_cases(a: Path):
         "+mt_opd.n_additional_teachers=2",
         *teacher(1, t_code), *teacher(2, t_if),
     ]
-    cases.append(("mt_opd AS SHIPPED (mt_opd.sh:87, plain reward_mode)", "ppo_trainer", mt_shipped, False))
+    cases.append(("mt_opd invalid plain reward_mode (negative regression)", "ppo_trainer", mt_invalid, False))
 
     mt_fixed = [
         "algorithm.adv_estimator=token_reward_direct", *common_ppo(a),

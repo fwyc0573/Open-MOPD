@@ -2,12 +2,8 @@
 # Open-MOPD E2E — Step 60: MULTI-teacher on-policy distillation. The core of the paper.
 #
 # Two parts, both recorded:
-#   60a  the SHIPPED launcher, scripts/local/mt_opd.sh --run. Expected to FAIL at Hydra
-#        composition: mt_opd.sh:87 emits `actor_rollout_ref.rollout.reward_mode=mt_opd`
-#        with no leading '+' (while the same script correctly uses '+' for every
-#        mt_opd.* key), and reward_mode is declared in no YAML and absent from
-#        RolloutConfig. Confirmed by 15_config_probe.py.
-#   60b  the CORRECTED direct invocation, three teachers, three domains.
+#   60a  the repaired local launcher, scripts/local/mt_opd.sh --run.
+#   60b  the corrected direct invocation, three teachers, three domains.
 #
 # The MT-OPD switches:
 #   +actor_rollout_ref.rollout.reward_mode=mt_opd   ray_trainer.py:644 -> use_mt_opd
@@ -43,7 +39,7 @@ LOG_A="$LOGS/60a_mt_opd_shipped_launcher.log"
 LOG_B="$LOGS/60b_mt_opd_corrected_$MT_MODE.log"
 mkdir -p "$OUT/checkpoints"
 
-banner "60a — SHIPPED scripts/local/mt_opd.sh --run (expected: Hydra rejects plain reward_mode)"
+banner "60a — REPAIRED scripts/local/mt_opd.sh --run"
 set +e
 env PYTHON_BIN="$PY" TRAIN_BATCH_SIZE="$TRAIN_BS" \
     MAX_PROMPT_LENGTH="$MAX_PROMPT_LEN" MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LEN" \
@@ -56,8 +52,7 @@ env PYTHON_BIN="$PY" TRAIN_BATCH_SIZE="$TRAIN_BS" \
         --output "$RUNS/mt_opd-shipped" --gpus "$GPUS" 2>&1 | tee "$LOG_A"
 rc_a=${PIPESTATUS[0]}
 set -e
-echo "[60a] exit=$rc_a  (nonzero is the documented defect, not a test failure)"
-grep -m2 -A2 "Could not override\|ConfigCompositionException" "$LOG_A" || echo "[60a] no composition error seen — re-check the finding"
+echo "[60a] repaired launcher exit=$rc_a"
 
 # ---- assemble the mechanism overrides
 MECH=()

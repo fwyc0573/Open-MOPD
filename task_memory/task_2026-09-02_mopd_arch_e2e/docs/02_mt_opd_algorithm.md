@@ -5,6 +5,7 @@
 | Date       | Summary of Changes                                                    |
 | ---------- | --------------------------------------------------------------------- |
 | 2026-09-02 | First version. Kernel (`mt_opd.py`, 563 lines) and the trainer reward block (`ray_trainer.py:2100-2230`) read line-by-line; all claims re-verified against source. |
+| 2026-09-04 | Updated launcher, teacher-binding, and conflict-threshold behavior after double-check. |
 
 **Prerequisite.** [`01_architecture.md`](01_architecture.md) for the layer map and data
 contracts. This document is the algorithm.
@@ -267,7 +268,7 @@ passed. Empty dict for fewer than two teachers.
 | `reward_scale_direction` | `"divide"` | `divide` \| `multiply` | ⚠️ `divide` is the default and is documented as measured harmful (§3.4) | `:719-726` |
 | `reward_scale_anchored` | `False` | bool | pins the `multiply` reference at step 1. Requires `multiply` + `mean` | `:727-738` |
 | `conflict_policy` | `"none"` | `none` \| `mask` \| `consensus` | **M3** | `:746-753` |
-| `conflict_nats` | `1.0` | float | the **policy** threshold only — not the metric threshold (§6) | `:754-756` |
+| `conflict_nats` | `1.0` | float | shared threshold for M3 policy and conflict metrics | `:754-756`, `:2177-2183` |
 | `conflict_quantile` | `None` | float ∈ (0, 1) | self-calibrating; overrides `conflict_nats`. ⚠️ `0.0` silently becomes `None` (`:758` truthiness) | `:757-765` |
 
 A note on the two M1 forms: the source comment at `:671-673` says a dict-valued Hydra
@@ -285,8 +286,8 @@ see §6), `+actor_rollout_ref.rollout.top_k_strategy`, `+...reward_weight_mode`,
 
 ## 5. Minimal working invocation
 
-The shipped `scripts/local/mt_opd.sh` cannot run as released — see §6.1. This is the
-corrected form:
+The local `scripts/local/mt_opd.sh` emits the following runtime extension keys and
+teacher settings. The same form is useful when invoking `main_ppo` directly:
 
 ```bash
 python -m verl.trainer.main_ppo \
@@ -378,16 +379,17 @@ from the code teacher, silently, forever.
 
 ### 6.3 Silently wrong
 
-7. **An unknown `domain` label does not raise.** Uniform `1/N` teacher row (`mt_opd.py:60-61`),
-   and target `0.0` under M1 (`:225`) ⇒ zero gradient for those sequences, with the
-   remaining domains scaled up to compensate. Only trace: an extra metric series.
+7. **Unknown `domain` labels now fail before routing.** The MT-OPD trainer rejects labels
+   outside `teacher_domains` before `build_domain_weights`; the standalone helper retains
+   its uniform fallback for non-trainer callers.
 
-8. **Teacher↔domain binding is positional and unverified** beyond the count.
+8. **Teacher↔domain binding is validated at trainer setup.** The trainer requires exactly
+   `n_additional_teachers + 1` unique, non-empty domain labels, then preserves positional
+   mapping through worker registration and routing.
 
-9. **`mt_opd/conflict/contested_frac` is pinned at 1.0 nats** regardless of
-   `mt_opd.conflict_nats`. `:2177-2183` passes only `teacher_logprobs`, `response_mask`,
-   `domains`, so the kernel default (`mt_opd.py:498`) applies. Tune `conflict_nats` and the
-   policy threshold moves while the metric does not.
+9. **`conflict_nats` reaches both policy and metric.** The trainer passes
+   `self.mt_conflict_nats` at `:2177-2183`, so policy and reported contested fractions use
+   the same configured threshold.
 
 10. **M1 + M3-mask changes the loss scale.** Each factor alone has token-weighted mean 1;
     their product at `:2222` is not re-normalized, while both docstrings advertise

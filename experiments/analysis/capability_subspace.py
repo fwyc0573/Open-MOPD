@@ -355,8 +355,11 @@ def top_rank_directions(delta: torch.Tensor, rank: int) -> torch.Tensor:
     if torch.count_nonzero(mat) == 0:
         return mat.new_zeros((0, mat.numel()))
     q = min(rank, min(mat.shape))
-    u, s, v = torch.svd_lowrank(mat, q=q, niter=4)
-    dirs = [torch.outer(u[:, i], v[:, i]).reshape(-1) for i in range(q)]
+    # This helper materializes explicit directions for small diagnostics and tests.
+    # Use the exact deterministic decomposition so repeated calls agree with the
+    # singular-value energy path and do not introduce randomized approximation error.
+    u, _s, vh = torch.linalg.svd(mat, full_matrices=False)
+    dirs = [torch.outer(u[:, i], vh[i, :]).reshape(-1) for i in range(q)]
     return torch.stack(dirs, dim=0)
 
 

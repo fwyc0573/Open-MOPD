@@ -5,11 +5,22 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
+    _validate_mt_teacher_binding,
     _ensure_validation_data_source,
     _validation_batch_uses_model_reward,
     _validation_ground_truth,
 )
 from verl.workers.actor.mt_opd import build_domain_weights, select_routed_teacher_logprobs
+
+
+def test_mt_teacher_binding_requires_matching_unique_domains() -> None:
+    _validate_mt_teacher_binding(["math", "code", "if"], 2)
+    with pytest.raises(ValueError, match="teacher count"):
+        _validate_mt_teacher_binding(["math", "code"], 2)
+    with pytest.raises(ValueError, match="unique"):
+        _validate_mt_teacher_binding(["math", "math", "if"], 2)
+    with pytest.raises(ValueError, match="non-empty"):
+        _validate_mt_teacher_binding(["math", "", "if"], 2)
 
 
 def _training_batch() -> DataProto:

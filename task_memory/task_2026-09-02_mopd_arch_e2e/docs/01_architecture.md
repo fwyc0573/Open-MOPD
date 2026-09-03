@@ -5,6 +5,7 @@
 | Date       | Summary of Changes                                                        |
 | ---------- | ------------------------------------------------------------------------- |
 | 2026-09-02 | First version. Built from a 12-subsystem deep read, adversarially verified, then re-vetted claim-by-claim (43/48 confirmed; corrections folded in). |
+| 2026-09-04 | Recorded repaired OPD/MT-OPD launcher keys and positional teacher validation. |
 
 **Scope of this document.** Where the code lives, who calls whom, and what crosses each
 boundary. The MT-OPD algorithm itself is in
@@ -112,7 +113,7 @@ CPU in seconds.
 
 | Symbol | Line | Returns | One-line contract |
 | --- | --- | --- | --- |
-| `build_domain_weights` | 24 | `[B,N]` f32 | domain label → one-hot teacher row. **An unknown label does not raise** — it gets uniform `1/N` (`:57-61`) |
+| `build_domain_weights` | 24 | `[B,N]` f32 | domain label → one-hot teacher row; standalone helper keeps uniform `1/N` fallback for unknown labels (`:57-61`), while the MT trainer rejects unknown labels before calling it |
 | `select_routed_teacher_logprobs` | 65 | `[B,T,K]` | stacks N teacher tensors to `[N,B,T,K]`, contracts with `[N,B,1,1]`. Returns a NEW tensor |
 | `compute_domain_share_metrics` | 90 | `dict[str,float]` | the diagnosis: `prompt_share` vs `token_share` per domain |
 | `compute_domain_loss_weights` | 159 | `[B]` f32 **or `None`** | M1+M2. `None` when `target_shares is None` (`:207-208`) ⇒ loss bit-identical to naive |
@@ -440,27 +441,21 @@ Declared keys whose defaults will break a small run:
 
 Read this section before you tune anything.
 
-### 7.1 The two launchers that cannot run as released **[probed]**
+### 7.1 Launcher runtime extension keys **[repaired 2026-09-04]**
 
-`scripts/local/opd.sh:66` and `scripts/local/mt_opd.sh:87` emit
-`actor_rollout_ref.rollout.reward_mode=<mode>` **without** a leading `+`, while the same
-`mt_opd.sh` correctly uses `+` for every `mt_opd.*` key. Since `reward_mode` is declared
-nowhere, Hydra refuses:
+`reward_mode` and `log_prob_top_k` are runtime extension keys rather than YAML/dataclass
+fields. The repaired `scripts/local/opd.sh:66-67` and `scripts/local/mt_opd.sh:87-88`
+append both keys with `+`, which Hydra accepts:
 
 ```
 ConfigCompositionException: Could not override 'actor_rollout_ref.rollout.reward_mode'.
 To append to your config use +actor_rollout_ref.rollout.reward_mode=mt_opd
 ```
 
-This fires at composition time — before Ray starts, before any GPU is touched. Add the `+`.
-
-Second, no launcher and no YAML sets `log_prob_top_k`, and `ray_trainer.py:1968` reads it
-with a default of `0`, so `mt_opd` and `delta_opd` raise at `:1973-1974`. Add
-`+actor_rollout_ref.rollout.log_prob_top_k=<K>`.
-
-Third, `mt_opd.sh` sets `input_tokenizer=null` and `param_offload=True` only for teachers
-`1..N-1` (`:107-111`); **teacher 0** inherits the non-null default and hits the
-`raw_prompt` path. Add `reward_model.model.input_tokenizer=null`.
+The compose-only probe retains the old plain form as a negative regression, while the
+current launcher form composes successfully before Ray starts. `mt_opd.sh:90-92` also sets
+teacher-0 `input_tokenizer=null`, remove-padding, and parameter offload to match additional
+teachers and avoid the raw-prompt retokenization path.
 
 ### 7.2 The shipped `mt_opd.sh` is naive M-OPD, not Open-MOPD
 
