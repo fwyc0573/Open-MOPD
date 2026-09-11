@@ -95,6 +95,8 @@ set +e
     reward_model.model.use_remove_padding=False \
     +reward_model.model.override_config.attn_implementation=eager \
     reward_model.micro_batch_size_per_gpu="$MICRO_BS" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="$MINI_BS" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="$MICRO_BS" \
     "+mt_opd.teacher_domains=[math,code,if]" \
     "+mt_opd.n_additional_teachers=2" \
     "+mt_opd.domain_weighting=domain_routing" \

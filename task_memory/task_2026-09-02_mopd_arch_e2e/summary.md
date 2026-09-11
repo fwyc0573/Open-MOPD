@@ -4,8 +4,10 @@
 
 | Date       | Summary of Changes |
 | ---------- | ------------------ |
+| 2026-09-11 | Hardened reproducibility docs around CPU-built persistent venv, preflight, and one-command H800 reruns. |
 | 2026-09-03 | Archived the architecture deliverables, corrected E2E implementation, and final validation evidence. |
 | 2026-09-04 | Archived double-check results and scoped repairs for launcher, MT-OPD, GRM, and capability follow-ups. |
+| 2026-09-11 | Archived the successful personal H800 E2E using a persistent worker-portable Python 3.12 environment. |
 
 ## Task Overview
 
@@ -29,6 +31,7 @@ download was involved.
 * `/data/ycfeng/Open-MOPD/task_memory/task_2026-09-02_mopd_arch_e2e/future.md`
 * `/data/ycfeng/Open-MOPD/experiments/tests/test_if_rl_grm.py`
 * `/data/ycfeng/Open-MOPD/experiments/analysis/capability_subspace.py`
+* `/data/ycfeng/Open-MOPD/task_memory/task_2026-09-02_mopd_arch_e2e/test_report_2026-09-11_personal_h800_persistent_venv.md`
 
 ## Validation Status
 
@@ -47,6 +50,7 @@ download was involved.
 | MT-OPD | PASS corrected paths | 3 domains; M1 weights code/if/math `1.3697561/0.5695741/1.1209581` |
 | Eval | PASS | 12 rows, 64 completion tokens, verifier exit `0` |
 | Optional repo suite | KNOWN FAILURES | `111 passed, 8 failed`; GRM fixtures and one tolerance test |
+| Personal H800 E2E (`exp-0911-152629-174180`) | PASS | Worker and launcher terminal status succeeded; all stages exit 0; 12-row offline vLLM rollout |
 
 ## Open Items/Future Extensions
 
@@ -56,3 +60,11 @@ remains unchanged because switching to the measured-preferred `multiply` changes
 semantics and needs an explicit migration decision. The verifier still has no `dummy_math`
 scorer, so the offline eval records artifact/schema evidence only. The unrelated repo-suite
 failures remain documented in the original test report.
+
+
+The persistent environment uses `torch 2.8.0+cu128`, `vllm 0.11.0`, `transformers 4.57.6`, `ray 2.55.1`, editable `verl`, IF dependencies, and locally staged NLTK tokenizers. The verifier result remains `unknown_dataset` for synthetic `dummy_math`; this E2E is a control path and dependency validation, not a benchmark quality or convergence result.
+
+The repeat-run contract is documented in `docs/03_reproduce_e2e.md`: repair and preflight
+the worker-portable venv on the CPU host, then submit one local StepMind RJob using the
+mounted environment. `task_memory/env_handbook.md`, `harness.md`, and `notes.md` record
+the same rule so future runs do not install dependencies dynamically on GPU workers.

@@ -1,0 +1,38 @@
+{
+  "observed_at": "2026-09-10T15:27:51.081988+00:00",
+  "name": "exp-0910-224825-381481",
+  "creator": "i-fengyicheng",
+  "status": {
+    "phase": "Pending",
+    "reason": "RJob is queuing",
+    "message": "RJob is queuing",
+    "taskStatuses": {
+      "default": {
+        "taskStage": "stepmind-task-stage-1"
+      }
+    },
+    "taskStage": "stepmind-task-stage-1"
+  },
+  "tasks": {
+    "default": {
+      "mount": "100.96.128.189:/data/ycfeng:/data/ycfeng",
+      "containers": [
+        {
+          "image": "hub.i.basemind.com/stepmind/megatron-step:test-optimus-3.24.0-stepccl-0.0.5.post5-vllm-0.11.0.post37-20260817-2733176",
+          "resources": {
+            "limits": {
+              "cpu": "16",
+              "memory": "132000Mi",
+              "nvidia.com/gpu": "1"
+            },
+            "requests": {
+              "cpu": "16",
+              "memory": "132000Mi",
+              "nvidia.com/gpu": "1"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

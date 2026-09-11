@@ -62,6 +62,8 @@ set +e
     reward_model.model.use_remove_padding=False \
     +reward_model.model.override_config.attn_implementation=eager \
     reward_model.micro_batch_size_per_gpu="$MICRO_BS" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="$MINI_BS" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="$MICRO_BS" \
     custom_reward_function.path="$OPD_VAL_REWARD" \
     custom_reward_function.name=reward_func \
     trainer.default_local_dir="$OUT/checkpoints" \

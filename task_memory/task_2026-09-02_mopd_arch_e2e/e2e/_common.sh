@@ -19,7 +19,7 @@ export TRANSFORMERS_OFFLINE=1
 export PYTHONPATH="$REPO/training/verl:${PYTHONPATH:-}"
 
 PY="$VENV/bin/python"
-TORCHRUN="$VENV/bin/torchrun"
+TORCHRUN="${TORCHRUN:-$VENV/bin/torchrun}"
 
 MODEL_STUDENT="$ASSETS/models/student"
 MODEL_T_MATH="$ASSETS/models/teacher_math"
@@ -64,6 +64,7 @@ data.max_prompt_length=$MAX_PROMPT_LEN
 data.max_response_length=$MAX_RESPONSE_LEN
 data.filter_overlong_prompts=True
 data.truncation=error
+data.dataloader_num_workers=0
 actor_rollout_ref.model.path=$MODEL_STUDENT
 actor_rollout_ref.model.use_remove_padding=False
 +actor_rollout_ref.model.override_config.attn_implementation=eager

@@ -4,6 +4,7 @@
 
 | Date       | Summary of Changes                          |
 | ---------- | ------------------------------------------- |
+| 2026-09-11 | Record persistent CPU-built environment and one-run worker reuse contract. |
 | 2026-09-02 | Initial environment + repo scouting results |
 
 ## Host environment (scouted 2026-09-02)
@@ -25,6 +26,16 @@ Consequence: any stage that needs vLLM rollout or FSDP/Megatron training must ru
 `rlaunch` GPU worker (`--charged-group=codesign --private-machine=group --positive-tags=h800`).
 CPU-only stages (data prep, launcher dry-runs, unit tests, verifier scoring, param merge,
 analysis) run directly on this node.
+
+## Repeat-run operational contract (verified 2026-09-11)
+
+Build `/data/ycfeng/envs/openmopd-py312` once on this CPU host with
+`e2e/00_setup_env.sh`, then run the import/version and NLTK data probes documented in
+`docs/03_reproduce_e2e.md`. The H800 wrapper mounts and reuses this exact environment;
+it should not resolve or install dependencies at worker startup. If a worker reports a
+missing library, record the first traceback and repair the persistent venv locally before
+submitting again. This keeps retries after reclaim deterministic and prevents a sequence
+of GPU jobs that each discover one additional package.
 
 ## Repo facts worth remembering
 

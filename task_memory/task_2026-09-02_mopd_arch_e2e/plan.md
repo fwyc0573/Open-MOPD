@@ -4,6 +4,7 @@
 
 | Date       | Summary of Changes                                                       |
 | ---------- | ------------------------------------------------------------------------ |
+| 2026-09-10 | Record personal Python H800 reproduction and verified runtime observations. |
 | 2026-09-02 | Initial plan; scope fixed by user decision (GPU-first high-fidelity E2E) |
 | 2026-09-04 | Added continuation plan for evidence-led future-work double-check and scoped repairs. |
 
@@ -133,3 +134,7 @@ Every stage must produce observable evidence, not just exit 0:
    land in the same place, with zero weight downloads.
 4. Any stage that cannot run is reported as a blocker with its root cause — not
    worked around silently.
+
+## 2026-09-10 reproduction continuation
+
+Dependency: runtime verification -> image launcher -> full offline chain -> artifact audit -> report and guide. Preserve the historical SFT, merge, RL, OPD, MT-OPD naive/M1 and evaluation scope; do not substitute a platform probe for E2E completion. Use the image runtime only after verifying imports and executable paths. Record failed stages and correct their demonstrated causes.
