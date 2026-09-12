@@ -1206,9 +1206,10 @@ class RayPPOTrainer:
                 f"{row_mask_key!r} must be one value per batch row; got shape={values.shape}, "
                 f"batch_size={len(batch.batch)}"
             )
-        if not np.isfinite(values.astype(np.float32, copy=False)).all() or not np.isin(values, [0, 1]).all():
+        numeric_values = values.astype(np.float32, copy=False)
+        if not np.isfinite(numeric_values).all() or not np.isin(numeric_values, [0, 1]).all():
             raise ValueError(f"{row_mask_key!r} must contain only finite binary values 0 or 1")
-        batch.batch[row_mask_key] = torch.as_tensor(values, dtype=torch.bool)
+        batch.batch[row_mask_key] = torch.as_tensor(numeric_values, dtype=torch.bool)
 
     def _validate(self):
         data_source_lst = []
