@@ -1163,6 +1163,12 @@ class RayPPOTrainer:
         reward_model_keys = (
             {"data_source", "reward_model", "extra_info", "uid", "domain"} & batch.non_tensor_batch.keys()
         )
+        row_mask_key = self.config.actor_rollout_ref.actor.get("opd_row_mask_key", None)
+        if row_mask_key and row_mask_key in batch.non_tensor_batch:
+            # Keep the optional Direction-1 intervention metadata on the
+            # original training batch until actor update.  It is converted to
+            # a tensor immediately before the worker call below.
+            reward_model_keys.add(row_mask_key)
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1177,6 +1183,32 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _materialize_opd_row_mask(self, batch: DataProto) -> None:
+        """Convert a dataset row mask into the actor batch tensor.
+
+        RLHFDataset keeps unknown parquet columns in ``non_tensor_batch``.
+        The actor intervention expects a binary ``[batch]`` tensor, so this
+        small bridge makes the data contract explicit without changing the
+        native OPD reward or teacher forward path.
+        """
+        row_mask_key = self.config.actor_rollout_ref.actor.get("opd_row_mask_key", None)
+        if not row_mask_key or row_mask_key in batch.batch:
+            return
+        if row_mask_key not in batch.non_tensor_batch:
+            raise KeyError(
+                f"actor.opd_row_mask_key={row_mask_key!r} is configured, "
+                "but the training batch contains neither a tensor nor a dataset field with that name"
+            )
+        values = np.asarray(batch.non_tensor_batch[row_mask_key])
+        if values.ndim != 1 or values.shape[0] != len(batch.batch):
+            raise ValueError(
+                f"{row_mask_key!r} must be one value per batch row; got shape={values.shape}, "
+                f"batch_size={len(batch.batch)}"
+            )
+        if not np.isfinite(values.astype(np.float32, copy=False)).all() or not np.isin(values, [0, 1]).all():
+            raise ValueError(f"{row_mask_key!r} must contain only finite binary values 0 or 1")
+        batch.batch[row_mask_key] = torch.as_tensor(values, dtype=torch.bool)
 
     def _validate(self):
         data_source_lst = []
@@ -3525,6 +3557,7 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_config = self.config.actor_rollout_ref.actor
+                            self._materialize_opd_row_mask(batch)
                             if actor_config.get("use_kl_loss", False) and actor_config.get(
                                 "adaptive_kl_loss_coef", False
                             ):
