@@ -1189,7 +1189,7 @@ class RayPPOTrainer:
 
         RLHFDataset keeps unknown parquet columns in ``non_tensor_batch``.
         The actor intervention expects a binary ``[batch]`` tensor, so this
-        small bridge makes the data contract explicit without changing the
+        small bridge makes the data rule explicit without changing the
         native OPD reward or teacher forward path.
         """
         row_mask_key = self.config.actor_rollout_ref.actor.get("opd_row_mask_key", None)
