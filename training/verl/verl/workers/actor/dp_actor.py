@@ -43,7 +43,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.mt_opd import refresh_opd_advantage
+from verl.workers.actor.mt_opd import apply_row_mask, refresh_opd_advantage
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
@@ -959,6 +959,14 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        row_mask_key = self.config.get("opd_row_mask_key", None)
+        if row_mask_key:
+            if row_mask_key not in data.batch.keys():
+                raise KeyError(
+                    f"actor.opd_row_mask_key={row_mask_key!r} is configured, "
+                    "but that key is missing from the actor batch"
+                )
+            select_keys.append(row_mask_key)
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -1028,12 +1036,25 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                mini_batch_has_effective_tokens = False
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
+                    if row_mask_key:
+                        response_mask = apply_row_mask(response_mask, model_inputs[row_mask_key])
+                        mini_batch_has_effective_tokens |= bool(response_mask.any().item())
+                        micro_batch_metrics["opd/row_mask/retained_rows"] = (
+                            model_inputs[row_mask_key].to(dtype=torch.bool).sum().detach().item()
+                        )
+                        micro_batch_metrics["opd/row_mask/total_rows"] = float(
+                            model_inputs[row_mask_key].shape[0]
+                        )
+                        micro_batch_metrics["opd/row_mask/retained_tokens"] = (
+                            response_mask.sum().detach().item()
+                        )
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -1218,7 +1239,12 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                if mini_batch_has_effective_tokens or not row_mask_key:
+                    grad_norm = self._optimizer_step()
+                else:
+                    # An explicit skip row mask must not trigger AdamW weight decay
+                    # or an otherwise empty optimizer step.
+                    grad_norm = torch.zeros((), device=get_device_id())
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()

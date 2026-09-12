@@ -78,6 +78,8 @@ class ActorConfig(BaseConfig):
         kl_loss_type (str): Type of KL loss to use.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
+        opd_row_mask_key (Optional[str]): Optional batch key for a binary
+            retained/skip mask applied to OPD policy-loss rows.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
@@ -127,6 +129,10 @@ class ActorConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     opd_refresh_advantage: bool = False
     opd_reward_weight_mode: str = "student_p"
+    # Optional batch key containing one binary retained/skip value per response row.
+    # When set, the key is used only to mask policy/entropy/KL loss participation;
+    # teacher and student forward passes still cover the complete batch.
+    opd_row_mask_key: Optional[str] = None
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

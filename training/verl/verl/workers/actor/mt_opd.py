@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 __all__ = [
+    "apply_row_mask",
     "build_domain_weights",
     "select_routed_teacher_logprobs",
     "compute_domain_share_metrics",
@@ -19,6 +20,35 @@ __all__ = [
     "compute_domain_loss_weights",
     "apply_teacher_conflict_policy",
 ]
+
+
+def apply_row_mask(response_mask: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+    """Apply a binary per-trajectory mask to the response-token mask.
+
+    This is the fixed-prefix intervention used by Direction-1 micro-updates. A
+    retained value of ``1`` keeps the complete generated response row; ``0``
+    removes every response token from the policy, entropy, and KL losses. The
+    operation only changes loss participation. Teacher/student forward passes
+    are still run for the complete batch, so this helper must not be reported as
+    a compute saving.
+    """
+    if response_mask.ndim != 2:
+        raise ValueError(
+            f"response_mask must have shape [batch, response_length], got {tuple(response_mask.shape)}"
+        )
+    if row_mask.ndim != 1 or row_mask.shape[0] != response_mask.shape[0]:
+        raise ValueError(
+            "row_mask must have shape [batch] matching response_mask; "
+            f"got row_mask={tuple(row_mask.shape)}, response_mask={tuple(response_mask.shape)}"
+        )
+    row_mask = row_mask.to(device=response_mask.device)
+    if row_mask.dtype == torch.bool:
+        binary = row_mask
+    else:
+        if not torch.isfinite(row_mask).all() or not torch.all((row_mask == 0) | (row_mask == 1)):
+            raise ValueError("row_mask must contain only finite binary values 0 or 1")
+        binary = row_mask.to(dtype=torch.bool)
+    return response_mask * binary.unsqueeze(-1).to(dtype=response_mask.dtype)
 
 
 def build_domain_weights(
