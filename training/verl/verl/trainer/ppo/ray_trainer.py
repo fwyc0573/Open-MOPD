@@ -1343,6 +1343,32 @@ class RayPPOTrainer:
                 test_batch.batch["response_mask"] = compute_response_mask(test_batch)
             response_lengths = test_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
 
+            # Preserve the same stable sample identity used by training
+            # rollout dumps so post-update validation can be joined back to
+            # its input row and row-mask decision.
+            for key in (
+                "family_id",
+                "shape",
+                "variant",
+                "rollout_index",
+                "source_sample_id",
+                "opd_row_mask",
+            ):
+                if key in test_batch.non_tensor_batch:
+                    values = test_batch.non_tensor_batch[key]
+                    reward_extra_infos_dict[key].extend(
+                        values.tolist() if hasattr(values, "tolist") else list(values)
+                    )
+            configured_max_tokens = self.config.actor_rollout_ref.rollout.response_length
+            if configured_max_tokens is None:
+                configured_max_tokens = test_output_gen_batch.batch["responses"].shape[-1]
+            max_tokens = int(configured_max_tokens)
+            reward_extra_infos_dict["completion_tokens"].extend(response_lengths)
+            reward_extra_infos_dict["max_tokens"].extend([max_tokens] * len(response_lengths))
+            reward_extra_infos_dict["hit_max_tokens"].extend(
+                [int(tokens >= max_tokens) for tokens in response_lengths]
+            )
+
             # evaluate using reward_function
             use_distributed_reward = should_use_distributed_reward(self.config)
             # Async-rollout inline reward: when rollout.mode=async each val trajectory was
