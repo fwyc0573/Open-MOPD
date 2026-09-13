@@ -1067,6 +1067,14 @@ class RayPPOTrainer:
                 inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                 outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                 scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                response_mask = batch.batch.get("response_mask")
+                if response_mask is None:
+                    response_mask = compute_response_mask(batch)
+                completion_tokens = response_mask.sum(dim=-1).detach().cpu().tolist()
+                configured_max_tokens = self.config.actor_rollout_ref.rollout.response_length
+                if configured_max_tokens is None:
+                    configured_max_tokens = batch.batch["responses"].shape[-1]
+                max_tokens = int(configured_max_tokens)
                 sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
                 reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
@@ -1089,6 +1097,11 @@ class RayPPOTrainer:
                             values.tolist() if hasattr(values, "tolist") else list(values),
                         )
                 reward_extra_infos_to_dump["rollout_round"] = [rollout_round] * len(inputs)
+                reward_extra_infos_to_dump["completion_tokens"] = completion_tokens
+                reward_extra_infos_to_dump["max_tokens"] = [max_tokens] * len(inputs)
+                reward_extra_infos_to_dump["hit_max_tokens"] = [
+                    int(tokens >= max_tokens) for tokens in completion_tokens
+                ]
 
                 self._dump_generations(
                     inputs=inputs,
