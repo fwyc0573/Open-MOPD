@@ -1070,7 +1070,18 @@ class RayPPOTrainer:
                 sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
                 reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-                for key in ("request_id", "uid", "data_source", "domain"):
+                for key in (
+                    "request_id",
+                    "uid",
+                    "data_source",
+                    "domain",
+                    "family_id",
+                    "shape",
+                    "variant",
+                    "rollout_index",
+                    "source_sample_id",
+                    "opd_row_mask",
+                ):
                     if key in batch.non_tensor_batch:
                         values = batch.non_tensor_batch[key]
                         reward_extra_infos_to_dump.setdefault(
