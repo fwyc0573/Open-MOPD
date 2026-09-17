@@ -1834,11 +1834,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             warnings.simplefilter("ignore")
             model_config.classifier_dropout = 0.0
             model_config.hidden_dropout = "0"
+            override_model_config = config.model.get("override_config", {}) or {}
+            attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
             reward_module = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=model_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 trust_remote_code=trust_remote_code,
             )
 
