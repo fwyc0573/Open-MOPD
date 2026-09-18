@@ -3,6 +3,7 @@
 import pytest
 
 from verl.workers.actor.mt_opd import PAPER_DOMAIN_RESPONSE_CAPS, domain_generation_groups
+from verl.workers.config.rollout import RolloutConfig
 
 
 def test_if_uses_2048_and_math_code_use_16384() -> None:
@@ -17,6 +18,15 @@ def test_if_uses_2048_and_math_code_use_16384() -> None:
 def test_unknown_domain_fails_before_generation() -> None:
     with pytest.raises(ValueError, match="unknown domain"):
         domain_generation_groups(["math", "other"], PAPER_DOMAIN_RESPONSE_CAPS)
+
+
+def test_rollout_config_accepts_domain_response_length() -> None:
+    cfg = RolloutConfig(
+        name="vllm",
+        domain_response_length=dict(PAPER_DOMAIN_RESPONSE_CAPS),
+    )
+    assert cfg.get("domain_response_length")["if"] == 2048
+    assert cfg.domain_response_length["math"] == 16384
 
 
 def test_restore_order_is_the_original_row_index() -> None:

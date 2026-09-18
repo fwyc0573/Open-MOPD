@@ -117,6 +117,11 @@ class RolloutConfig(BaseConfig):
     prompt_length: int = 512
     response_length: int = 512
 
+    # Per-domain request cap applied before sampling. Keys are domain labels
+    # such as math/code/if. Padding still uses max(values) or response_length.
+    # Generating IF at 16384 and truncating afterwards is not this cap.
+    domain_response_length: Optional[dict[str, int]] = None
+
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     ignore_eos: bool = False
