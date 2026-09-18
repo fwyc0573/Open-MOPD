@@ -43,7 +43,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.mt_opd import refresh_opd_advantage
+from verl.workers.actor.mt_opd import refresh_opd_advantage, require_m4_refresh_tensors
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
@@ -1207,7 +1207,9 @@ class DataParallelPPOActor(BasePPOActor):
         # MT-OPD M4: the frozen teacher's log-probs on the student's sampled ids. Needed
         # in the inner loop to rebuild the reward against the current student; it is the
         # cacheable half of the reward, so carrying it costs one tensor and no compute.
-        if self._opd_refresh_advantage and "teacher_on_student_log_probs" in data.batch.keys():
+        # Diagnostic mt_teacher_* scores are not a substitute for this routed tensor.
+        if self._opd_refresh_advantage:
+            require_m4_refresh_tensors(data.batch.keys(), refresh_advantage=True)
             select_keys.append("teacher_on_student_log_probs")
 
         # Include student_top_k_ids if present (for fixing "apples-to-oranges" bug)
@@ -1322,11 +1324,15 @@ class DataParallelPPOActor(BasePPOActor):
                         # before the earlier inner updates -- and reward staleness is the
                         # one staleness term that is free to fix, since `T_on_S` is frozen
                         # and `topk_log_probs` was already computed for the gradient.
-                        if (
-                            self._opd_refresh_advantage
-                            and not on_policy
-                            and "teacher_on_student_log_probs" in model_inputs
-                        ):
+                        if self._opd_refresh_advantage and not on_policy:
+                            if advantages.dim() != 3:
+                                raise ValueError(
+                                    "opd_refresh_advantage=True requires 3D top-k "
+                                    f"advantages; got {tuple(advantages.shape)}"
+                                )
+                            require_m4_refresh_tensors(
+                                model_inputs.keys(), refresh_advantage=True
+                            )
                             advantages = refresh_opd_advantage(
                                 student_top_k_log_probs=topk_log_probs,
                                 teacher_on_student_log_probs=model_inputs[

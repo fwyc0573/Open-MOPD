@@ -79,6 +79,8 @@ from verl.workers.actor.mt_opd import (
     compute_domain_loss_weights,
     compute_domain_share_metrics,
     compute_teacher_conflict_metrics,
+    drop_unused_teacher_tensors_before_actor_update,
+    require_m4_refresh_tensors,
     select_routed_teacher_logprobs,
 )
 
@@ -3475,19 +3477,19 @@ class RayPPOTrainer:
 
                     self._dump_data_proto(batch, timing_raw, stage="post_advantage")
 
-                    # Pop unused keys to save memory before PPO update
-                    keys_to_pop = [
-                        "teacher_on_student_log_probs",
-                        "teacher_top_k_ids",
-                        "teacher_top_k_log_probs",
-                        "teacher_entropy",
-                        "overlap_mask",
-                        "teacher_in_student_mask",
-                        "student_log_probs_on_teacher_ids",
-                    ]
-                    for key in keys_to_pop:
-                        if key in batch.batch.keys():
-                            batch.batch.pop(key)
+                    # Drop unused teacher tensors before PPO update. Keep the
+                    # routed canonical q when M4 refresh will consume it.
+                    refresh_advantage = bool(
+                        self.config.actor_rollout_ref.actor.get(
+                            "opd_refresh_advantage", False
+                        )
+                    )
+                    drop_unused_teacher_tensors_before_actor_update(
+                        batch.batch, refresh_advantage=refresh_advantage
+                    )
+                    require_m4_refresh_tensors(
+                        batch.batch.keys(), refresh_advantage=refresh_advantage
+                    )
 
                     # update critic
                     if self.use_critic:

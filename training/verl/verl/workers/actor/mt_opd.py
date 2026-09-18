@@ -12,13 +12,30 @@ import numpy as np
 import torch
 
 __all__ = [
+    "ROUTED_TEACHER_Q_KEY",
     "build_domain_weights",
     "select_routed_teacher_logprobs",
+    "batch_keys_to_drop_before_actor_update",
+    "drop_unused_teacher_tensors_before_actor_update",
+    "require_m4_refresh_tensors",
     "compute_domain_share_metrics",
     "compute_teacher_conflict_metrics",
     "compute_domain_loss_weights",
     "apply_teacher_conflict_policy",
 ]
+
+ROUTED_TEACHER_Q_KEY = "teacher_on_student_log_probs"
+
+# Teacher tensors that M4 refresh does not consume. Extra per-teacher scores
+# are diagnostics after routing; they must not stand in for the routed q.
+DIAGNOSTIC_TEACHER_KEYS_SAFE_TO_DROP = (
+    "teacher_top_k_ids",
+    "teacher_top_k_log_probs",
+    "teacher_entropy",
+    "overlap_mask",
+    "teacher_in_student_mask",
+    "student_log_probs_on_teacher_ids",
+)
 
 
 def build_domain_weights(
@@ -38,27 +55,41 @@ def build_domain_weights(
         weighting: Strategy for assigning weights.
 
             * ``"domain_routing"`` — one-hot: the teacher whose domain matches
-              gets weight 1, all others get 0.  Samples whose domain is not in
-              ``domain_order`` fall back to uniform.
+              gets weight 1, all others get 0. Unknown labels raise; there is
+              no uniform fallback.
             * ``"uniform"`` — equal weight ``1/N`` for every teacher.
 
     Returns:
         Float32 tensor of shape ``[B, N]``.
     """
     n = len(domain_order)
-    b = len(domains) if domains is not None else 1
-
-    if domains is None or weighting == "uniform":
+    if weighting == "uniform":
+        b = len(domains) if domains is not None else 1
         return torch.full((b, n), 1.0 / n, dtype=torch.float32, device=device)
 
+    if domains is None:
+        raise ValueError(
+            "domain_routing requires per-sample domain labels; "
+            "uniform fallback is not allowed"
+        )
+
+    b = len(domains)
     weights = torch.zeros(b, n, dtype=torch.float32, device=device)
     domain_to_idx: dict[str, int] = {d: i for i, d in enumerate(domain_order)}
+    unknown: list[str] = []
     for sample_idx, d in enumerate(domains):
-        teacher_idx = domain_to_idx.get(str(d), -1)
+        label = str(d)
+        teacher_idx = domain_to_idx.get(label, -1)
         if teacher_idx >= 0:
             weights[sample_idx, teacher_idx] = 1.0
         else:
-            weights[sample_idx] = 1.0 / n
+            unknown.append(label)
+    if unknown:
+        raise ValueError(
+            "domain_routing has unknown domain labels "
+            f"{sorted(set(unknown))}; expected one of {list(domain_order)}. "
+            "Uniform fallback is not allowed."
+        )
     return weights
 
 
@@ -85,6 +116,72 @@ def select_routed_teacher_logprobs(
     w = domain_weights.to(dtype=stacked.dtype, device=stacked.device)
     w = w.transpose(0, 1).reshape(n, -1, 1, 1)  # [N, B, 1, 1]
     return (w * stacked).sum(dim=0)
+
+
+def _is_extra_mt_teacher_logprob_key(key: str) -> bool:
+    return key.startswith("mt_teacher_") and key.endswith("_on_student_log_probs")
+
+
+def batch_keys_to_drop_before_actor_update(
+    existing_keys,
+    *,
+    refresh_advantage: bool,
+) -> list[str]:
+    """Tensor names the trainer may delete before ``update_actor``.
+
+    M4 refresh consumes the routed canonical q. Extra per-teacher scores and
+    unused teacher-support diagnostics are safe to drop after routing.
+    """
+    drop: list[str] = []
+    seen: set[str] = set()
+    for key in existing_keys:
+        if key in seen:
+            continue
+        drop_key = (
+            key in DIAGNOSTIC_TEACHER_KEYS_SAFE_TO_DROP
+            or _is_extra_mt_teacher_logprob_key(key)
+            or (key == ROUTED_TEACHER_Q_KEY and not refresh_advantage)
+        )
+        if drop_key:
+            drop.append(key)
+            seen.add(key)
+    return drop
+
+
+def drop_unused_teacher_tensors_before_actor_update(
+    batch,
+    *,
+    refresh_advantage: bool,
+) -> None:
+    """Delete unused teacher tensors on ``batch`` in place.
+
+    ``batch`` is the TensorDict (``DataProto.batch``), not the DataProto.
+    """
+    for key in batch_keys_to_drop_before_actor_update(
+        list(batch.keys()), refresh_advantage=refresh_advantage
+    ):
+        if key in batch.keys():
+            batch.pop(key)
+
+
+def require_m4_refresh_tensors(batch_keys, *, refresh_advantage: bool) -> None:
+    """Fail before the actor update when refresh is on but q or support IDs are missing."""
+    if not refresh_advantage:
+        return
+    keys = set(batch_keys)
+    if ROUTED_TEACHER_Q_KEY not in keys:
+        raise ValueError(
+            "opd_refresh_advantage=True requires the routed tensor "
+            "'teacher_on_student_log_probs' on the learner batch. "
+            "Diagnostic mt_teacher_*_on_student_log_probs tensors are not a substitute."
+        )
+    if "student_top_k_ids" not in keys and "union_top_k_ids" not in keys:
+        raise ValueError(
+            "opd_refresh_advantage=True requires student_top_k_ids or "
+            "union_top_k_ids so the learner gathers the same support used to cache q."
+        )
+    if "response_mask" not in keys:
+        raise ValueError("opd_refresh_advantage=True requires response_mask")
 
 
 def compute_domain_share_metrics(
