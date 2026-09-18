@@ -18,6 +18,8 @@ __all__ = [
     "batch_keys_to_drop_before_actor_update",
     "drop_unused_teacher_tensors_before_actor_update",
     "require_m4_refresh_tensors",
+    "domain_generation_groups",
+    "gap_reference_magnitude",
     "compute_domain_share_metrics",
     "compute_teacher_conflict_metrics",
     "compute_domain_loss_weights",
@@ -182,6 +184,74 @@ def require_m4_refresh_tensors(batch_keys, *, refresh_advantage: bool) -> None:
         )
     if "response_mask" not in keys:
         raise ValueError("opd_refresh_advantage=True requires response_mask")
+
+
+PAPER_DOMAIN_RESPONSE_CAPS = {"math": 16384, "code": 16384, "if": 2048}
+
+
+def domain_generation_groups(
+    domains: Sequence[str] | np.ndarray,
+    caps: dict[str, int],
+) -> list[tuple[str, list[int], int]]:
+    """Group row indices by domain for per-request generation caps.
+
+    Generation must use these caps. Generating IF at 16384 and truncating
+    afterwards is not the same as a 2048 request cap.
+    """
+    if domains is None:
+        raise ValueError("domain_response_length requires per-sample domain labels")
+    groups: dict[str, list[int]] = {}
+    order: list[str] = []
+    unknown: list[str] = []
+    for index, domain in enumerate(domains):
+        label = str(domain)
+        if label not in caps:
+            unknown.append(label)
+            continue
+        if label not in groups:
+            order.append(label)
+            groups[label] = []
+        groups[label].append(index)
+    if unknown:
+        raise ValueError(
+            "domain_response_length has unknown domain labels "
+            f"{sorted(set(unknown))}; expected one of {sorted(caps)}"
+        )
+    return [(label, groups[label], int(caps[label])) for label in order]
+
+
+def gap_reference_magnitude(
+    domain_magnitudes: dict[str, float],
+    domain_token_shares: dict[str, float] | None,
+    source: str,
+) -> float:
+    """Reference magnitude for the gap term.
+
+    ``paper_equation`` is the unweighted mean of per-domain magnitudes (Eq.9).
+    ``author_native`` is the token-share-weighted mean used by unanchored
+    multiply in this repository. They are not the same source.
+    """
+    if source not in ("paper_equation", "author_native"):
+        raise ValueError(
+            "gap reference source must be paper_equation or author_native, "
+            f"got {source!r}"
+        )
+    if not domain_magnitudes:
+        raise ValueError("gap reference requires per-domain magnitudes")
+    if source == "paper_equation":
+        return float(sum(domain_magnitudes.values()) / len(domain_magnitudes))
+    if domain_token_shares is None:
+        raise ValueError("author_native gap reference requires token shares")
+    missing = [d for d in domain_magnitudes if d not in domain_token_shares]
+    if missing:
+        raise ValueError(f"token shares missing domains {missing}")
+    weight_sum = sum(float(domain_token_shares[d]) for d in domain_magnitudes)
+    if weight_sum <= 0:
+        raise ValueError("author_native gap reference requires positive token share")
+    return float(
+        sum(float(domain_token_shares[d]) * float(domain_magnitudes[d]) for d in domain_magnitudes)
+        / weight_sum
+    )
 
 
 def compute_domain_share_metrics(

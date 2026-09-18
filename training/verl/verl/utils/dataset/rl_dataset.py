@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -51,25 +52,44 @@ def _load_parquet_dataset_with_duckdb(parquet_file: str) -> datasets.Dataset:
     return datasets.Dataset(arrow_table)
 
 
-def _load_parquet_dataset(parquet_file: str) -> datasets.Dataset:
-    """Load RL parquet without datasets' chunked nested-array conversion path.
+def _dataset_from_arrow_table(table, parquet_file: str) -> datasets.Dataset:
+    """Build a Dataset without fingerprinting via combine_chunks.
 
-    Prefer batched pyarrow reads for speed. Fall back to duckdb for parquet
-    files whose nested columns (e.g. code RL ``reward_model.ground_truth`` test
-    payloads) are stored as chunked arrays that pyarrow cannot convert.
+    HuggingFace fingerprinting concatenates nested list offsets and overflows
+    on the full Open-MOPD train file. A path-based fingerprint keeps columns
+    and row order without that reduction.
+    """
+    digest = hashlib.sha256(parquet_file.encode("utf-8")).hexdigest()[:16]
+    return datasets.Dataset(table, fingerprint=f"mopd-parquet-{digest}")
+
+
+def _load_parquet_dataset(parquet_file: str) -> datasets.Dataset:
+    """Load RL parquet without converting all nested rows to Python lists.
+
+    Prefer batched pyarrow tables. Fall back to duckdb when nested list offsets
+    overflow or when pyarrow cannot convert chunked nested columns.
     """
     import pyarrow.parquet as pq
 
     try:
-        rows: list[dict] = []
+        import pyarrow as pa
+
         parquet_reader = pq.ParquetFile(parquet_file)
-        for batch in parquet_reader.iter_batches(batch_size=_PARQUET_READ_BATCH_ROWS):
-            rows.extend(batch.to_pylist())
-        return datasets.Dataset.from_list(rows)
+        tables = [
+            pa.Table.from_batches([batch])
+            for batch in parquet_reader.iter_batches(batch_size=_PARQUET_READ_BATCH_ROWS)
+        ]
+        if not tables:
+            table = parquet_reader.read()
+        else:
+            table = pa.concat_tables(tables)
+        return _dataset_from_arrow_table(table, parquet_file)
     except Exception as exc:
         exc_name = type(exc).__name__
         exc_text = str(exc)
-        if exc_name != "ArrowNotImplementedError" and "Nested data conversions" not in exc_text:
+        overflow = "offset overflow" in exc_text
+        nested = "Nested data conversions" in exc_text
+        if exc_name not in {"ArrowNotImplementedError", "ArrowInvalid"} and not nested and not overflow:
             raise
         logger.warning(
             "Falling back to duckdb parquet reader for %s after %s: %s",

@@ -52,10 +52,7 @@ def test_get_gen_batch_preserves_mt_opd_domain_for_teacher_routing(async_rollout
 
     assert batch.non_tensor_batch["domain"].tolist() == ["math", "code"]
     assert batch.non_tensor_batch["uid"].tolist() == ["uid-0", "uid-1"]
-    if async_rollout_mode:
-        assert gen_batch.non_tensor_batch["domain"].tolist() == ["math", "code"]
-    else:
-        assert "domain" not in gen_batch.non_tensor_batch
+    assert gen_batch.non_tensor_batch["domain"].tolist() == ["math", "code"]
 
 
 def test_formal_eval_dataset_column_becomes_validation_data_source() -> None:

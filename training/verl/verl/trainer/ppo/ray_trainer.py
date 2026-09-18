@@ -1160,6 +1160,11 @@ class RayPPOTrainer:
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
+        # Per-domain generation caps need the domain on the gen batch in both
+        # sync and async rollout. Teacher routing still uses the original batch.
+        if "domain" in batch.non_tensor_batch and "domain" not in gen_batch.non_tensor_batch:
+            gen_batch.non_tensor_batch["domain"] = batch.non_tensor_batch["domain"]
+
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)

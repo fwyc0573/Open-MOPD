@@ -597,40 +597,59 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+        def _generate_with_sampling(inputs, sampling_kwargs, lora_request):
+            with self.update_sampling_params(**sampling_kwargs):
+                return self.inference_engine.generate(
+                    prompts=inputs,
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+        domain_caps = self.config.get("domain_response_length", None)
+        if domain_caps and not is_validate:
+            from verl.workers.actor.mt_opd import domain_generation_groups
 
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+            domains = non_tensor_batch.get("domain")
+            groups = domain_generation_groups(domains, dict(domain_caps))
+            padding_max_length = max(int(cap) for cap in dict(domain_caps).values())
+            outputs = [None] * batch_size
+            for _domain, indices, max_tokens in groups:
+                group_inputs = [vllm_inputs[i] for i in indices]
+                group_lora = [lora_requests[i] for i in indices] if lora_requests else None
+                group_out = _generate_with_sampling(
+                    group_inputs, {**kwargs, "max_tokens": int(max_tokens)}, group_lora
+                )
+                for local, orig in enumerate(indices):
+                    outputs[orig] = group_out[local]
+        else:
+            outputs = _generate_with_sampling(vllm_inputs, kwargs, lora_requests)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=padding_max_length).to(
-                idx.device
-            )
-            if self.config.calculate_log_probs:
-                rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=padding_max_length
-                ).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
+        # TODO(sgm): disable logprob when recompute_log_prob is enable
+        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-            seq = torch.cat([idx, response], dim=-1)
+        response = []
+        rollout_log_probs = []
+        for output in outputs:
+            for sample_id in range(len(output.outputs)):
+                response_ids = output.outputs[sample_id].token_ids
+                response.append(response_ids)
+                if self.config.calculate_log_probs:
+                    curr_log_prob = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        curr_log_prob.append(logprob[response_ids[i]].logprob)
+                    rollout_log_probs.append(curr_log_prob)
+
+        response = pad_2d_list_to_length(response, self.pad_token_id, max_length=padding_max_length).to(
+            idx.device
+        )
+        if self.config.calculate_log_probs:
+            rollout_log_probs = pad_2d_list_to_length(
+                rollout_log_probs, -1, max_length=padding_max_length
+            ).to(idx.device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
+
+        seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
