@@ -63,7 +63,13 @@ def parse_args() -> argparse.Namespace:
         choices=["true", "false"],
         help="Pass enable_thinking to tokenizer.apply_chat_template for chat-style prompt rows.",
     )
-    
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for the engine and SamplingParams. Omit to keep the previous default.",
+    )
+
     # 分布式节点参数 (如果只在单机跑，默认即可)
     parser.add_argument("--node-size", type=int, default=1, help="Total number of nodes")
     parser.add_argument("--node-rank", type=int, default=0, help="Rank of the current node")
@@ -86,7 +92,9 @@ def llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["max_num_seqs"] = args.max_num_seqs
     if args.max_num_batched_tokens is not None:
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
-    
+    if args.seed is not None:
+        kwargs["seed"] = args.seed
+
     # 注意：这里坚决不能传入 data_parallel_size，因为我们要用 CUDA_VISIBLE_DEVICES 物理隔离
     return kwargs
 
@@ -133,6 +141,7 @@ def sampling_from_config(
     n: int,
     max_tokens: int,
     stop_token_ids: list[int] | None,
+    seed: int | None = None,
 ) -> Any:
     from vllm import SamplingParams
 
@@ -141,11 +150,12 @@ def sampling_from_config(
         "top_p": top_p,
         "n": n,
         "max_tokens": max_tokens,
+        "top_k": top_k,
     }
-    if top_k >= 0:
-        kwargs["top_k"] = top_k
     if stop_token_ids:
         kwargs["stop_token_ids"] = stop_token_ids
+    if seed is not None:
+        kwargs["seed"] = seed
     return SamplingParams(**kwargs)
 
 
@@ -226,6 +236,7 @@ def run_file_partition(
     global_dp_rank: int,
     base: int,
     offset: int | None,
+    seed: int | None = None,
 ) -> list[Path]:
     df = pd.read_parquet(path)
     
@@ -271,6 +282,7 @@ def run_file_partition(
         n=n,
         max_tokens=max_tokens,
         stop_token_ids=stop_token_ids,
+        seed=seed,
     )
     prompts = [prompt_to_text(prompt, tokenizer, enable_thinking) for prompt in df_slice["prompt"].tolist()]
     results = llm.generate(prompts, params)
@@ -364,6 +376,7 @@ def worker_main(
             global_dp_rank=global_dp_rank,
             base=args.base,
             offset=args.offset,
+            seed=args.seed,
         )
         for out in out_paths:
             print(f"[Worker Rank {global_dp_rank}] Output written to: {out}")

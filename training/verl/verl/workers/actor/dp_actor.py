@@ -51,6 +51,64 @@ __all__ = ["DataParallelPPOActor", "_compute_delta_opd_rm_scores"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+R5_TRACE_ENV = "MOPD_R5_TRACE"
+
+
+def r5_trace_enabled():
+    """True only when MOPD_R5_TRACE is an explicit on-value. Default is off."""
+    return os.environ.get(R5_TRACE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _r5_rank():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return int(torch.distributed.get_rank())
+
+
+def _r5_is_rank0():
+    return _r5_rank() == 0
+
+
+def _r5_trace_dir():
+    from pathlib import Path
+
+    root = os.environ.get("MOPD_R5_TRACE_DIR") or os.environ.get("TMPDIR") or "."
+    path = Path(root) / "r5_trace"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _r5_tensor_sha256(tensor):
+    import hashlib
+
+    cpu = tensor.detach()
+    if isinstance(cpu, DTensor):
+        cpu = cpu.to_local()
+    cpu = cpu.to("cpu")
+    if cpu.dtype == torch.bfloat16:
+        cpu = cpu.float()
+    return hashlib.sha256(cpu.contiguous().numpy().tobytes()).hexdigest()
+
+
+def _r5_sample_ids(mini_batch):
+    ntb = getattr(mini_batch, "non_tensor_batch", None) or {}
+    for key in ("uid", "index"):
+        if key in ntb:
+            return [str(item) for item in ntb[key]]
+    extra = ntb.get("extra_info")
+    if extra is not None:
+        ids = []
+        for item in extra:
+            if isinstance(item, dict) and item.get("index") is not None:
+                ids.append(str(item["index"]))
+            else:
+                ids.append("")
+        return ids
+    batch = getattr(mini_batch, "batch", None)
+    if batch is not None and "responses" in batch.keys():
+        return [f"row-{i}" for i in range(int(batch["responses"].shape[0]))]
+    return []
+
 
 def _align_rmpad_topk_ids_for_ulysses(
     topk_ids: torch.Tensor,
@@ -836,7 +894,168 @@ class DataParallelPPOActor(BasePPOActor):
             "exopd_delta_rm_scores": delta_rm_scores,
         })
 
-    def _optimizer_step(self):
+    def _r5_snapshot_params(self):
+        """A few named parameter slices. This is not a full model dump."""
+        chosen = []
+        for name, param in self.actor_module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name for token in ("embed_tokens", "lm_head", "q_proj", "down_proj")):
+                chosen.append((name, param))
+            if len(chosen) >= 4:
+                break
+        if len(chosen) < 2:
+            for name, param in self.actor_module.named_parameters():
+                if param.requires_grad:
+                    chosen.append((name, param))
+                if len(chosen) >= 4:
+                    break
+        snap = {}
+        for name, param in chosen:
+            tensor = param.detach()
+            if isinstance(tensor, DTensor):
+                tensor = tensor.to_local()
+            snap[name] = tensor.float().reshape(-1)[:256].cpu().contiguous().clone()
+        return snap
+
+    def _r5_append_jsonl(self, payload):
+        import json
+
+        payload = dict(payload)
+        payload["dp_rank"] = _r5_rank()
+        path = _r5_trace_dir() / f"optimizer_steps.rank{_r5_rank()}.jsonl"
+        with path.open("a") as stream:
+            stream.write(json.dumps(payload, default=str) + "\n")
+
+    def _r5_dump_learner_batch(self, data):
+        if getattr(self, "_r5_learner_batch_dumped", False):
+            return
+        import json
+
+        sample_ids = _r5_sample_ids(data)
+        adv = data.batch["advantages"] if hasattr(data, "batch") and "advantages" in data.batch.keys() else None
+        payload = {
+            "event": "learner_input_after_acquisition",
+            "dp_rank": _r5_rank(),
+            "n_rows": int(len(sample_ids)),
+            "sample_ids": sample_ids,
+            "advantage_shape": list(adv.shape) if adv is not None else None,
+            "batch_keys": list(data.batch.keys()) if hasattr(data, "batch") else [],
+            "has_teacher_on_student_log_probs": bool(
+                hasattr(data, "batch") and "teacher_on_student_log_probs" in data.batch.keys()
+            ),
+            "opd_refresh_advantage": bool(getattr(self, "_opd_refresh_advantage", False)),
+            "note": (
+                "No trainer acquisition rewrite. Sample ids plus per-rank optimizer JSONL "
+                "are the reuse trace. One outer batch is trainer.total_training_steps=1."
+            ),
+        }
+        batch = getattr(data, "batch", None)
+        if batch is not None:
+            if "responses" in batch.keys():
+                payload["response_sha256"] = _r5_tensor_sha256(batch["responses"])
+            if "student_top_k_ids" in batch.keys():
+                payload["student_top_k_ids_sha256"] = _r5_tensor_sha256(batch["student_top_k_ids"])
+            if "teacher_on_student_log_probs" in batch.keys():
+                payload["teacher_on_student_log_probs_sha256"] = _r5_tensor_sha256(
+                    batch["teacher_on_student_log_probs"]
+                )
+        path = _r5_trace_dir() / f"learner_input.rank{_r5_rank()}.json"
+        if not path.exists():
+            path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+        self._r5_learner_batch_dumped = True
+
+    def _r5_write_param_delta(self):
+        if getattr(self, "_r5_param_delta_written", False) or not _r5_is_rank0():
+            return
+        import hashlib
+        import json
+
+        before = getattr(self, "_r5_param_before", None)
+        after = self._r5_snapshot_params()
+        if not before:
+            return
+        summary = []
+        for name in before:
+            if name not in after:
+                continue
+            delta = after[name] - before[name]
+            piece = delta[:64].contiguous()
+            summary.append(
+                {
+                    "name": name,
+                    "delta_norm": float(delta.norm().item()),
+                    "slice_sha256": hashlib.sha256(piece.numpy().tobytes()).hexdigest(),
+                    "numel": int(delta.numel()),
+                }
+            )
+        path = _r5_trace_dir() / "param_delta.json"
+        path.write_text(
+            json.dumps(
+                {"params": summary, "weights_changed": any(item["delta_norm"] > 0.0 for item in summary)},
+                indent=2,
+            )
+            + "\n"
+        )
+        self._r5_param_delta_written = True
+
+    def _r5_on_skipped_step(self, epoch_index, minibatch_index, mini_batch, grad_norm):
+        sample_ids = _r5_sample_ids(mini_batch) if mini_batch is not None else []
+        self._r5_append_jsonl(
+            {
+                "event": "skipped_nonfinite_optimizer_step",
+                "successful_optimizer_step": int(getattr(self, "_r5_successful_optimizer_steps", 0)),
+                "minibatch_index": minibatch_index,
+                "epoch": epoch_index,
+                "sample_ids": sample_ids,
+                "exposure_increment": 0,
+                "grad_norm": None if grad_norm is None else float(grad_norm.detach().cpu()),
+            }
+        )
+
+    def _r5_on_successful_step(self, epoch_index, minibatch_index, mini_batch, grad_norm):
+        self._r5_successful_optimizer_steps = int(getattr(self, "_r5_successful_optimizer_steps", 0)) + 1
+        sample_ids = _r5_sample_ids(mini_batch) if mini_batch is not None else []
+        unique_ids = []
+        seen = set()
+        for item in sample_ids:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique_ids.append(item)
+        payload = {
+            "event": "successful_optimizer_step",
+            "successful_optimizer_step": self._r5_successful_optimizer_steps,
+            "minibatch_index": minibatch_index,
+            "epoch": epoch_index,
+            "sample_ids": unique_ids,
+            "exposure_increment": 1,
+            "n_samples": len(unique_ids),
+            "grad_norm": None if grad_norm is None else float(grad_norm.detach().cpu()),
+        }
+        if mini_batch is not None and hasattr(mini_batch, "batch"):
+            batch = mini_batch.batch
+            if "advantages" in batch.keys():
+                payload["advantage_shape"] = list(batch["advantages"].shape)
+            if "responses" in batch.keys():
+                payload["response_sha256"] = _r5_tensor_sha256(batch["responses"])
+            if "student_top_k_ids" in batch.keys():
+                payload["student_top_k_ids_sha256"] = _r5_tensor_sha256(batch["student_top_k_ids"])
+            if "student_top_k_log_probs" in batch.keys():
+                payload["old_topk_logp_sha256"] = _r5_tensor_sha256(batch["student_top_k_log_probs"])
+            if "teacher_on_student_log_probs" in batch.keys():
+                payload["teacher_q_sha256"] = _r5_tensor_sha256(batch["teacher_on_student_log_probs"])
+        if getattr(self, "_r5_last_current_topk_sha", None):
+            payload["current_topk_logp_sha256"] = self._r5_last_current_topk_sha
+            payload["refresh_a_sha256"] = self._r5_last_refresh_a_sha
+            payload["stale_a_sha256"] = self._r5_last_stale_a_sha
+            payload["stale_equals_refresh"] = self._r5_last_refresh_a_sha == self._r5_last_stale_a_sha
+            if getattr(self, "_r5_last_teacher_q_sha", None):
+                payload["teacher_q_sha256"] = self._r5_last_teacher_q_sha
+        self._r5_append_jsonl(payload)
+        self._r5_write_param_delta()
+
+    def _optimizer_step(self, epoch_index=None, minibatch_index=None, mini_batch=None):
         assert self.config.grad_clip is not None
 
         if isinstance(self.actor_module, FSDP):
@@ -853,8 +1072,14 @@ class DataParallelPPOActor(BasePPOActor):
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
+            if r5_trace_enabled():
+                self._r5_on_skipped_step(epoch_index, minibatch_index, mini_batch, grad_norm)
         else:
+            if r5_trace_enabled() and not getattr(self, "_r5_param_before", None):
+                self._r5_param_before = self._r5_snapshot_params()
             self.actor_optimizer.step()
+            if r5_trace_enabled():
+                self._r5_on_successful_step(epoch_index, minibatch_index, mini_batch, grad_norm)
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -1006,6 +1231,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if r5_trace_enabled():
+            self._r5_dump_learner_batch(data)
+            for key in ("uid", "index", "data_source", "extra_info"):
+                if key in data.non_tensor_batch.keys() and key not in non_tensor_select_keys:
+                    non_tensor_select_keys.append(key)
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -1016,7 +1246,7 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -1106,6 +1336,23 @@ class DataParallelPPOActor(BasePPOActor):
                                 reward_weight_mode=self._opd_reward_weight_mode,
                             )
                             micro_batch_metrics["mt_opd/m4_advantage_refreshed"] = 1.0
+                            if r5_trace_enabled():
+                                stale = refresh_opd_advantage(
+                                    student_top_k_log_probs=model_inputs["student_top_k_log_probs"],
+                                    teacher_on_student_log_probs=model_inputs[
+                                        "teacher_on_student_log_probs"
+                                    ],
+                                    response_mask=response_mask,
+                                    reward_weight_mode=self._opd_reward_weight_mode,
+                                )
+                                self._r5_last_current_topk_sha = _r5_tensor_sha256(topk_log_probs.detach())
+                                self._r5_last_refresh_a_sha = _r5_tensor_sha256(advantages.detach())
+                                self._r5_last_stale_a_sha = _r5_tensor_sha256(stale.detach())
+                                self._r5_last_teacher_q_sha = _r5_tensor_sha256(
+                                    model_inputs["teacher_on_student_log_probs"]
+                                )
+                                if student_top_k_ids is not None:
+                                    self._r5_last_ids_sha = _r5_tensor_sha256(student_top_k_ids)
 
                     else:
                         _, log_prob, *_ = self._forward_micro_batch(
@@ -1218,7 +1465,9 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                grad_norm = self._optimizer_step(
+                    epoch_index=epoch_idx, minibatch_index=batch_idx, mini_batch=mini_batch
+                )
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
