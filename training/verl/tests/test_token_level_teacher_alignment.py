@@ -89,3 +89,31 @@ def test_mismatched_token_id_mapping_fails_closed() -> None:
             response_length=1,
             max_length=4,
         )
+
+
+def test_scored_positions_match_an_unpadded_prefix_oracle() -> None:
+    """The fixed-width logits slice maps to every sampled response prefix."""
+    source = _Tokenizer()
+    target = _Tokenizer()
+    input_ids, attention_mask, responses, valid_length = _build_token_level_teacher_inputs(
+        raw_prompt=[{"role": "user", "content": "question"}],
+        source_response_ids=torch.tensor([10, 11, 12, 13]),
+        response_mask=torch.tensor([1, 1, 1, 1]),
+        source_tokenizer=source,
+        target_tokenizer=target,
+        response_length=4,
+        max_length=10,
+    )
+    content = input_ids[attention_mask.bool()]
+    prompt_len = content.numel() - valid_length
+
+    # A deterministic causal model: the logit at position p is the sum of all
+    # IDs through p.  This makes an off-by-one or left/right-padding shift
+    # observable without requiring a model download.
+    prefix_sums = content.to(torch.float64).cumsum(0)
+    scored = prefix_sums[prompt_len - 1 : prompt_len - 1 + valid_length]
+    oracle = torch.stack(
+        [content[: prompt_len + t].to(torch.float64).sum() for t in range(valid_length)]
+    )
+    assert torch.equal(scored, oracle)
+    assert torch.equal(input_ids[-valid_length:], responses[:valid_length])
