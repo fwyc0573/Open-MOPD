@@ -640,6 +640,9 @@ class vLLMRollout(BaseRollout):
                         curr_log_prob.append(logprob[response_ids[i]].logprob)
                     rollout_log_probs.append(curr_log_prob)
 
+        # EOS alone cannot distinguish generated tokens from padding when a
+        # shorter domain reaches its cap without EOS (including PAD == EOS).
+        generated_lengths = torch.tensor([len(tokens) for tokens in response], device=idx.device)
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=padding_max_length).to(
             idx.device
         )
@@ -666,6 +669,8 @@ class vLLMRollout(BaseRollout):
         response_attention_mask = get_response_mask(
             response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
         )
+        generated_mask = torch.arange(response_length, device=response.device)[None, :] < generated_lengths[:, None]
+        response_attention_mask = response_attention_mask * generated_mask.to(attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
