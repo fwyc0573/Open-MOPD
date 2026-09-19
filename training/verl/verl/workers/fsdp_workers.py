@@ -98,6 +98,29 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _validate_token_level_tokenizers(source_tokenizer, target_tokenizer):
+    """Validate the shared token-ID contract once when loading the teacher."""
+    if len(source_tokenizer) != len(target_tokenizer):
+        raise ValueError(
+            "token-level teacher scoring requires source and target tokenizers "
+            f"with the same vocabulary size, got {len(source_tokenizer)} and "
+            f"{len(target_tokenizer)}"
+        )
+    if source_tokenizer.get_vocab() != target_tokenizer.get_vocab():
+        raise ValueError("token-level teacher scoring requires identical token-to-ID mappings")
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        source_id = getattr(source_tokenizer, name)
+        target_id = getattr(target_tokenizer, name)
+        if source_id != target_id:
+            raise ValueError(
+                "token-level teacher scoring requires matching special-token IDs "
+                f"for {name}, got source={source_id} target={target_id}"
+            )
+
+    if target_tokenizer.pad_token_id is None:
+        raise ValueError("target tokenizer must define pad_token_id for fixed-width teacher inputs")
+
+
 def _build_token_level_teacher_inputs(
     *,
     raw_prompt: list[dict],
@@ -108,50 +131,24 @@ def _build_token_level_teacher_inputs(
     response_length: int,
     max_length: int,
 ):
-    """Build teacher inputs whose scored positions are the sampled response IDs.
+    """Left-pad the generation prompt in T-R slots, then append the original R slots.
 
-    The old implementation decoded the sampled response, rendered a complete
-    assistant turn, and then assumed that the last ``response_length`` tokens
-    were the sampled response.  Chat templates commonly add assistant markers
-    and EOS tokens, so that assumption can shift every teacher label.  Here the
-    teacher prompt is rendered with ``add_generation_prompt=True`` and the
-    actor's response IDs are appended verbatim.  The fixed-width sequence is
-    left-padded only after that concatenation, so the scorer's
-    ``[-response_length - 1:-1]`` slice has an explicit, auditable mapping.
+    Response token t is always at T-R+t and its predictor is T-R-1+t,
+    including short responses in a wider mixed batch. Tokenizer compatibility
+    is checked at teacher initialization, outside the per-sample path.
     """
-    if len(source_tokenizer) != len(target_tokenizer):
-        raise ValueError(
-            "token-level teacher scoring requires source and target tokenizers "
-            f"with the same vocabulary size, got {len(source_tokenizer)} and "
-            f"{len(target_tokenizer)}"
-        )
-    source_get_vocab = getattr(source_tokenizer, "get_vocab", None)
-    target_get_vocab = getattr(target_tokenizer, "get_vocab", None)
-    if callable(source_get_vocab) and callable(target_get_vocab):
-        if source_get_vocab() != target_get_vocab():
-            raise ValueError(
-                "token-level teacher scoring requires identical token-to-ID mappings"
-            )
-    for name in ("bos_token_id", "eos_token_id"):
-        source_id = getattr(source_tokenizer, name, None)
-        target_id = getattr(target_tokenizer, name, None)
-        if source_id != target_id:
-            raise ValueError(
-                "token-level teacher scoring requires matching special-token IDs "
-                f"for {name}, got source={source_id} target={target_id}"
-            )
-
-    if source_response_ids.dim() != 1:
-        raise ValueError(f"source_response_ids must be 1-D, got {tuple(source_response_ids.shape)}")
+    if source_response_ids.dim() != 1 or source_response_ids.numel() != response_length:
+        raise ValueError(f"source_response_ids must have shape [{response_length}], got {tuple(source_response_ids.shape)}")
     if response_mask.dim() != 1 or response_mask.numel() != response_length:
         raise ValueError(
             f"response_mask must have shape [{response_length}], got {tuple(response_mask.shape)}"
         )
 
     valid_length = int(response_mask.to(dtype=torch.long).sum().item())
-    if valid_length > response_length:
-        raise ValueError(f"response mask has {valid_length} valid tokens, exceeds {response_length}")
-    valid_response_ids = source_response_ids[:valid_length].detach().to(device="cpu", dtype=torch.long)
+    expected_mask = torch.arange(response_length, device=response_mask.device) < valid_length
+    if not torch.equal(response_mask, expected_mask.to(response_mask.dtype)):
+        raise ValueError("response_mask must contain a valid prefix of ones followed by right-padding zeros")
+    responses = source_response_ids.detach().to(device="cpu", dtype=torch.long).clone()
 
     prompt_ids = target_tokenizer.apply_chat_template(
         list(raw_prompt), add_generation_prompt=True, tokenize=True
@@ -160,28 +157,22 @@ def _build_token_level_teacher_inputs(
         prompt_ids = prompt_ids["input_ids"]
     prompt_ids = torch.as_tensor(prompt_ids, dtype=torch.long).reshape(-1).cpu()
 
-    if valid_length >= max_length:
+    prompt_capacity = max_length - response_length
+    if prompt_capacity <= 0:
         raise ValueError(
-            f"response length {valid_length} leaves no room for the teacher prompt in max_length={max_length}"
+            f"response width {response_length} leaves no room for the teacher prompt in max_length={max_length}"
         )
-    prompt_capacity = max_length - valid_length
     if prompt_ids.numel() > prompt_capacity:
         prompt_ids = prompt_ids[-prompt_capacity:]
-    content_ids = torch.cat((prompt_ids, valid_response_ids), dim=0)
-    if content_ids.numel() > max_length:
-        raise AssertionError("teacher content exceeded max_length after prompt truncation")
-
-    pad_len = max_length - content_ids.numel()
-    pad_id = target_tokenizer.pad_token_id
-    if pad_id is None:
-        raise ValueError("target tokenizer must define pad_token_id for fixed-width teacher inputs")
-    input_ids = torch.full((max_length,), int(pad_id), dtype=torch.long)
+    if prompt_ids.numel() == 0:
+        raise ValueError("teacher generation prompt must contain at least one predictor token")
+    pad_len = prompt_capacity - prompt_ids.numel()
+    input_ids = torch.full((max_length,), int(target_tokenizer.pad_token_id), dtype=torch.long)
     attention_mask = torch.zeros((max_length,), dtype=torch.long)
-    input_ids[pad_len:] = content_ids
-    attention_mask[pad_len:] = 1
-
-    responses = torch.full((response_length,), int(pad_id), dtype=torch.long)
-    responses[:valid_length] = valid_response_ids
+    input_ids[pad_len:prompt_capacity] = prompt_ids
+    input_ids[prompt_capacity:] = responses
+    attention_mask[pad_len:prompt_capacity] = 1
+    attention_mask[prompt_capacity:] = response_mask.to(device="cpu", dtype=torch.long)
     return input_ids, attention_mask, responses, valid_length
 
 
@@ -1903,6 +1894,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+            _validate_token_level_tokenizers(self.input_tokenizer, self.tokenizer)
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
@@ -1980,7 +1972,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):
@@ -2569,7 +2561,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         """Render the teacher prompt and append the sampled response IDs exactly.
 
         The teacher scorer consumes logits at ``[-R - 1:-1]``.  The returned
-        sequence therefore ends with the same response IDs that produced the
+        sequence therefore reserves R slots for the same response IDs that produced the
         student top-k support; assistant-template suffixes are never inserted
         between the prompt and those labels.
         """
@@ -2613,7 +2605,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 content_len = int(attention_mask.sum().item())
                 pad_len = max_length - content_len
                 print(f"  sample0 valid_response_length={valid_length}, content_len={content_len}, pad_len={pad_len}")
-                print(f"  content response IDs match tail: {torch.equal(input_ids[-valid_length:], responses[:valid_length]) if valid_length else True}")
+                print(f"  response slots match source: {torch.equal(input_ids[-response_length:], responses)}")
                 print(f"  last 10 input_ids: {input_ids[-10:].tolist()}")
                 print(f"  last 10 responses: {responses[-10:].tolist()}")
 
