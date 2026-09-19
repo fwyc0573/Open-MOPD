@@ -98,6 +98,93 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _build_token_level_teacher_inputs(
+    *,
+    raw_prompt: list[dict],
+    source_response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    source_tokenizer,
+    target_tokenizer,
+    response_length: int,
+    max_length: int,
+):
+    """Build teacher inputs whose scored positions are the sampled response IDs.
+
+    The old implementation decoded the sampled response, rendered a complete
+    assistant turn, and then assumed that the last ``response_length`` tokens
+    were the sampled response.  Chat templates commonly add assistant markers
+    and EOS tokens, so that assumption can shift every teacher label.  Here the
+    teacher prompt is rendered with ``add_generation_prompt=True`` and the
+    actor's response IDs are appended verbatim.  The fixed-width sequence is
+    left-padded only after that concatenation, so the scorer's
+    ``[-response_length - 1:-1]`` slice has an explicit, auditable mapping.
+    """
+    if len(source_tokenizer) != len(target_tokenizer):
+        raise ValueError(
+            "token-level teacher scoring requires source and target tokenizers "
+            f"with the same vocabulary size, got {len(source_tokenizer)} and "
+            f"{len(target_tokenizer)}"
+        )
+    source_get_vocab = getattr(source_tokenizer, "get_vocab", None)
+    target_get_vocab = getattr(target_tokenizer, "get_vocab", None)
+    if callable(source_get_vocab) and callable(target_get_vocab):
+        if source_get_vocab() != target_get_vocab():
+            raise ValueError(
+                "token-level teacher scoring requires identical token-to-ID mappings"
+            )
+    for name in ("bos_token_id", "eos_token_id"):
+        source_id = getattr(source_tokenizer, name, None)
+        target_id = getattr(target_tokenizer, name, None)
+        if source_id != target_id:
+            raise ValueError(
+                "token-level teacher scoring requires matching special-token IDs "
+                f"for {name}, got source={source_id} target={target_id}"
+            )
+
+    if source_response_ids.dim() != 1:
+        raise ValueError(f"source_response_ids must be 1-D, got {tuple(source_response_ids.shape)}")
+    if response_mask.dim() != 1 or response_mask.numel() != response_length:
+        raise ValueError(
+            f"response_mask must have shape [{response_length}], got {tuple(response_mask.shape)}"
+        )
+
+    valid_length = int(response_mask.to(dtype=torch.long).sum().item())
+    if valid_length > response_length:
+        raise ValueError(f"response mask has {valid_length} valid tokens, exceeds {response_length}")
+    valid_response_ids = source_response_ids[:valid_length].detach().to(device="cpu", dtype=torch.long)
+
+    prompt_ids = target_tokenizer.apply_chat_template(
+        list(raw_prompt), add_generation_prompt=True, tokenize=True
+    )
+    if isinstance(prompt_ids, dict):
+        prompt_ids = prompt_ids["input_ids"]
+    prompt_ids = torch.as_tensor(prompt_ids, dtype=torch.long).reshape(-1).cpu()
+
+    if valid_length >= max_length:
+        raise ValueError(
+            f"response length {valid_length} leaves no room for the teacher prompt in max_length={max_length}"
+        )
+    prompt_capacity = max_length - valid_length
+    if prompt_ids.numel() > prompt_capacity:
+        prompt_ids = prompt_ids[-prompt_capacity:]
+    content_ids = torch.cat((prompt_ids, valid_response_ids), dim=0)
+    if content_ids.numel() > max_length:
+        raise AssertionError("teacher content exceeded max_length after prompt truncation")
+
+    pad_len = max_length - content_ids.numel()
+    pad_id = target_tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("target tokenizer must define pad_token_id for fixed-width teacher inputs")
+    input_ids = torch.full((max_length,), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((max_length,), dtype=torch.long)
+    input_ids[pad_len:] = content_ids
+    attention_mask[pad_len:] = 1
+
+    responses = torch.full((response_length,), int(pad_id), dtype=torch.long)
+    responses[:valid_length] = valid_response_ids
+    return input_ids, attention_mask, responses, valid_length
+
+
 def _compute_student_topk_in_teacher_top_p_mask(
     logits: torch.Tensor,
     student_ids: torch.Tensor,
@@ -2479,187 +2566,73 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         return DataProto.from_dict(rm_inputs)
 
     def _switch_chat_template_token_level(self, data: DataProto):
-        """Re-tokenize with the RM's chat template while preserving token-level alignment.
+        """Render the teacher prompt and append the sampled response IDs exactly.
 
-        Unlike _switch_chat_template (which uses right-padding for sequence-level RM),
-        this function uses LEFT-padding so that the response stays at the end of the
-        sequence. This ensures that `[-response_length-1:-1]` correctly targets the
-        response positions for token-level distillation (student_top_k_ids alignment).
-
-        Requirements: actor and reward model must share the same vocabulary.
+        The teacher scorer consumes logits at ``[-R - 1:-1]``.  The returned
+        sequence therefore ends with the same response IDs that produced the
+        student top-k support; assistant-template suffixes are never inserted
+        between the prompt and those labels.
         """
         src_max_length = data.batch["attention_mask"].shape[-1]
-
         src_tokenizer = self.input_tokenizer
         target_tokenizer = self.tokenizer
+        response_length = data.batch["responses"].shape[-1]
+        max_length = self.config.get("max_length", src_max_length)
+        if max_length is None:
+            max_length = src_max_length
+        max_length = int(max_length)
 
-        is_debug = (self.rank == 0)  # only print on rank 0
-
+        is_debug = self.rank == 0
         if is_debug:
-            print(f"\n{'='*80}")
-            print(f"[DEBUG _switch_chat_template_token_level] START")
-            print(f"  src_tokenizer: {type(src_tokenizer).__name__}, vocab_size={src_tokenizer.vocab_size}")
-            print(f"  target_tokenizer: {type(target_tokenizer).__name__}, vocab_size={target_tokenizer.vocab_size}")
-            print(f"  src_max_length={src_max_length}")
-            print(f"  batch_size={data.batch.batch_size[0]}")
-            print(f"  original input_ids shape: {data.batch['input_ids'].shape}")
-            print(f"  original attention_mask shape: {data.batch['attention_mask'].shape}")
-            print(f"  original responses shape: {data.batch['responses'].shape}")
-            print(f"{'='*80}")
+            print(f"\n{'=' * 80}")
+            print("[DEBUG _switch_chat_template_token_level] START (explicit response append)")
+            print(f"  src_tokenizer: {type(src_tokenizer).__name__}, vocab_size={len(src_tokenizer)}")
+            print(f"  target_tokenizer: {type(target_tokenizer).__name__}, vocab_size={len(target_tokenizer)}")
+            print(f"  max_length={max_length}, response_length={response_length}")
 
         rm_input_ids = []
         rm_attention_mask = []
         rm_responses = []
-
         for i in range(data.batch.batch_size[0]):
-            if not isinstance(data.non_tensor_batch["raw_prompt"][i], list | np.ndarray):
-                raise TypeError(
-                    f"raw_prompt must be a list or numpy array, got {type(data.non_tensor_batch['raw_prompt'][i])}"
-                )
-
-            # extract raw prompt
-            chat: list = list(data.non_tensor_batch["raw_prompt"][i])
-
-            # extract response
-            response_ids = data.batch["responses"][i]
-            response_length = response_ids.shape[-1]
-            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode using the actor's tokenizer
-            response = src_tokenizer.decode(valid_response_ids)
-            # remove bos and eos
-            if src_tokenizer.eos_token:
-                response = response.replace(src_tokenizer.eos_token, "")
-
-            if is_debug and i == 0:
-                print(f"\n[DEBUG sample 0] --- Response decode/re-encode ---")
-                print(f"  original response_ids shape: {response_ids.shape}")
-                print(f"  response_length (padded): {response_length}")
-                print(f"  valid_response_length: {valid_response_length}")
-                print(f"  original response_ids (first 20): {valid_response_ids[:20].tolist()}")
-                print(f"  decoded response (first 200 chars): {response[:200]}")
-
-            chat.append({"role": "assistant", "content": response})
-
-            prompt_with_chat_template = target_tokenizer.apply_chat_template(
-                chat, add_generation_prompt=False, tokenize=False
-            )
-
-            if is_debug and i == 0:
-                print(f"  chat template applied (first 300 chars): {prompt_with_chat_template[:300]}")
-                print(f"  chat template applied (last 200 chars): {prompt_with_chat_template[-200:]}")
-
-            max_length = self.config.get("max_length", src_max_length)
-            if max_length is None:
-                max_length = src_max_length
-
-            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
-
-            if is_debug and i == 0:
-                raw_len = model_inputs["input_ids"].shape[-1]
-                print(f"  re-tokenized length (before pad/trunc): {raw_len}")
-                print(f"  max_length for postprocess: {max_length}")
-
-            input_ids, attention_mask = verl_F.postprocess_data(
-                input_ids=model_inputs["input_ids"],
-                attention_mask=model_inputs["attention_mask"],
+            raw_prompt = data.non_tensor_batch["raw_prompt"][i]
+            if not isinstance(raw_prompt, list | np.ndarray):
+                raise TypeError(f"raw_prompt must be a list or numpy array, got {type(raw_prompt)}")
+            input_ids, attention_mask, responses, valid_length = _build_token_level_teacher_inputs(
+                raw_prompt=list(raw_prompt),
+                source_response_ids=data.batch["responses"][i],
+                response_mask=data.batch["response_mask"][i],
+                source_tokenizer=src_tokenizer,
+                target_tokenizer=target_tokenizer,
+                response_length=response_length,
                 max_length=max_length,
-                pad_token_id=target_tokenizer.pad_token_id,
-                left_pad=True,  # LEFT padding to keep response at end
-                truncation=self.config.get("truncation", "left"),  # truncate prompt from left if needed
             )
-
+            rm_input_ids.append(input_ids.unsqueeze(0))
+            rm_attention_mask.append(attention_mask.unsqueeze(0))
+            rm_responses.append(responses.unsqueeze(0))
             if is_debug and i == 0:
-                content_len = attention_mask.sum().item()
+                content_len = int(attention_mask.sum().item())
                 pad_len = max_length - content_len
-                # find where content starts (first non-pad position)
-                first_content_pos = (attention_mask.squeeze(0) == 1).nonzero(as_tuple=True)[0]
-                first_pos = first_content_pos[0].item() if len(first_content_pos) > 0 else -1
-                last_pos = first_content_pos[-1].item() if len(first_content_pos) > 0 else -1
-                print(f"  after postprocess: input_ids shape={input_ids.shape}")
-                print(f"  content_len={content_len}, pad_len={pad_len}")
-                print(f"  content range: [{first_pos}, {last_pos}]")
-                print(f"  last 10 input_ids: {input_ids.squeeze(0)[-10:].tolist()}")
-                print(f"  last 10 attn_mask: {attention_mask.squeeze(0)[-10:].tolist()}")
-
-            rm_input_ids.append(input_ids)
-            rm_attention_mask.append(attention_mask)
-
-            # Re-tokenize the response alone with the target tokenizer to get correct response_ids
-            response_inputs = target_tokenizer(response, return_tensors="pt", add_special_tokens=False)
-            new_response_ids = response_inputs["input_ids"].squeeze(0)  # (new_resp_len,)
-
-            if is_debug and i == 0:
-                print(f"\n[DEBUG sample 0] --- Response re-tokenization ---")
-                print(f"  new_response_ids length: {new_response_ids.shape[0]}")
-                print(f"  original valid_response_length: {valid_response_length}")
-                print(f"  target response_length (padded): {response_length}")
-                print(f"  new_response_ids (first 20): {new_response_ids[:20].tolist()}")
-                print(f"  orig valid_response_ids (first 20): {valid_response_ids[:20].tolist()}")
-                # Check token-by-token match
-                min_len = min(new_response_ids.shape[0], valid_response_ids.shape[0])
-                match_count = (new_response_ids[:min_len] == valid_response_ids[:min_len].cpu()).sum().item()
-                print(f"  token match in first {min_len} tokens: {match_count}/{min_len}")
-                if match_count < min_len:
-                    # Find first mismatch
-                    for j in range(min_len):
-                        if new_response_ids[j] != valid_response_ids[j].cpu():
-                            print(f"  FIRST MISMATCH at pos {j}: new={new_response_ids[j].item()} "
-                                  f"('{target_tokenizer.decode([new_response_ids[j].item()])}') vs "
-                                  f"orig={valid_response_ids[j].item()} "
-                                  f"('{src_tokenizer.decode([valid_response_ids[j].item()])}')")
-                            break
-
-            # Pad/truncate to match original response_length for alignment
-            if new_response_ids.shape[0] >= response_length:
-                if is_debug and i == 0:
-                    print(f"  -> TRUNCATING new_response_ids from {new_response_ids.shape[0]} to {response_length}")
-                # truncate to original response_length
-                new_response_ids = new_response_ids[:response_length]
-            else:
-                pad_size = response_length - new_response_ids.shape[0]
-                if is_debug and i == 0:
-                    print(f"  -> PADDING new_response_ids from {new_response_ids.shape[0]} by {pad_size} to {response_length}")
-                # right-pad with pad_token_id
-                new_response_ids = torch.cat([
-                    new_response_ids,
-                    torch.full((pad_size,), target_tokenizer.pad_token_id, dtype=new_response_ids.dtype)
-                ])
-            rm_responses.append(new_response_ids.unsqueeze(0))
+                print(f"  sample0 valid_response_length={valid_length}, content_len={content_len}, pad_len={pad_len}")
+                print(f"  content response IDs match tail: {torch.equal(input_ids[-valid_length:], responses[:valid_length]) if valid_length else True}")
+                print(f"  last 10 input_ids: {input_ids[-10:].tolist()}")
+                print(f"  last 10 responses: {responses[-10:].tolist()}")
 
         rm_input_ids = torch.cat(rm_input_ids, dim=0)
         rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
         rm_responses = torch.cat(rm_responses, dim=0)
-
         rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
-
         if is_debug:
-            print(f"\n[DEBUG _switch_chat_template_token_level] FINAL SHAPES:")
-            print(f"  rm_input_ids: {rm_input_ids.shape}")
-            print(f"  rm_attention_mask: {rm_attention_mask.shape}")
-            print(f"  rm_position_ids: {rm_position_ids.shape}")
-            print(f"  rm_responses: {rm_responses.shape}")
-            # Verify response is at the end for first sample
-            resp_len = rm_responses.shape[-1]
-            last_tokens = rm_input_ids[0, -resp_len:].tolist()
-            resp_tokens = rm_responses[0].tolist()
-            # Check how many of the last resp_len tokens in input_ids match responses
-            match = sum(1 for a, b in zip(last_tokens, resp_tokens) if a == b)
-            print(f"  response_length={resp_len}")
-            print(f"  last {resp_len} input_ids tokens vs rm_responses match: {match}/{resp_len}")
-            print(f"  last 10 of input_ids[0]: {rm_input_ids[0, -10:].tolist()}")
-            print(f"  last 10 of rm_responses[0]: {rm_responses[0, -10:].tolist()}")
-            print(f"{'='*80}\n")
+            print(f"  rm_input_ids={tuple(rm_input_ids.shape)} rm_responses={tuple(rm_responses.shape)}")
+            print(f"{'=' * 80}\n")
 
-        rm_inputs = {
-            "input_ids": rm_input_ids,
-            "attention_mask": rm_attention_mask,
-            "position_ids": rm_position_ids,
-            "responses": rm_responses,
-        }
-
-        return DataProto.from_dict(rm_inputs)
+        return DataProto.from_dict(
+            {
+                "input_ids": rm_input_ids,
+                "attention_mask": rm_attention_mask,
+                "position_ids": rm_position_ids,
+                "responses": rm_responses,
+            }
+        )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
