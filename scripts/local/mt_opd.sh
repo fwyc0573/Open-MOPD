@@ -45,7 +45,7 @@ TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 local_export_runtime
 cd "$LOCAL_TRAINING_DIR"
 if [[ "$LOCAL_RUN" == 1 ]]; then
-    local_validate_common 1 1 1
+    local_validate_common 1 1 1 1
     ((${#LOCAL_TEACHER_PATHS[@]} >= 2)) || local_die "at least two --teacher paths are required"
     for teacher_path in "${LOCAL_TEACHER_PATHS[@]}"; do
         local_require_local_path teacher "$teacher_path"

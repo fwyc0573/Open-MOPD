@@ -7,6 +7,7 @@ construction) without requiring GPUs or model/data downloads.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -142,3 +143,43 @@ def test_run_mode_executes_with_local_paths_and_fake_binaries(tmp_path: Path) ->
         "math,code",
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_mt_run_mode_requires_explicit_external_ray_for_multiple_nodes(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    train = tmp_path / "train.parquet"
+    val = tmp_path / "val.parquet"
+    train.touch()
+    val.touch()
+    base = (
+        "--run", "--python", "/bin/echo", "--torchrun", "/bin/echo",
+        "--model", str(model), "--train", str(train), "--val", str(val),
+        "--output", str(tmp_path / "output"), "--gpus", "8",
+    )
+    for nodes, address, allowed in (
+        (1, None, True), (2, "127.0.0.1:6380", True),
+        (2, None, False), (2, "auto", False), (2, "local", False),
+        (2, "ray://127.0.0.1:10001", False),
+    ):
+        env = dict(os.environ)
+        env.pop("RAY_ADDRESS", None)
+        if address is not None:
+            env["RAY_ADDRESS"] = address
+        result = _run(
+            "mt_opd", *base, "--nodes", str(nodes),
+            "--teacher", str(model), "--teacher", str(model),
+            "--domains", "math,code", "--", "trainer.total_training_steps=600", env=env,
+        )
+        assert (result.returncode == 0) is allowed, (nodes, address, result.stderr)
+        if allowed:
+            # The printed preview and the fake Python execution must both carry
+            # the full configured horizon and requested native node count.
+            assert result.stdout.count(f"trainer.nnodes={nodes}") == 2
+            assert result.stdout.count("trainer.total_training_steps=600") == 2
+        else:
+            assert "NODES" in result.stderr
+    for name in ("sft", "eval"):
+        result = _run(name, *base, "--nodes", "2", env={**os.environ, "RAY_ADDRESS": "127.0.0.1:6380"})
+        assert result.returncode != 0, name
+        assert "NODES" in result.stderr

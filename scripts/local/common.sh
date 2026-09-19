@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for the explicit, single-machine launchers in this directory.
+# Shared helpers for explicit local-path launchers in this directory.
 #
 # The launchers are intentionally dry-run by default. Pass --run (or set
 # LOCAL_RUN=1) after checking the printed command and local paths.
@@ -51,7 +51,7 @@ Common options:
   --output PATH          local output directory (OUTPUT_DIR)
   --checkpoint PATH      local checkpoint directory (CHECKPOINT_DIR)
   --gpus N               processes/GPUs per node (GPUS)
-  --nodes N              node count; must be 1 (NODES, defaults to 1)
+  --nodes N              node count; defaults to 1 (MT-OPD can join external Ray)
   --python PATH          Python executable (PYTHON_BIN)
   --torchrun PATH        torchrun executable (TORCHRUN_BIN)
   --teacher PATH         append a teacher model path (TEACHER_PATH or
@@ -197,9 +197,13 @@ local_validate_common() {
     local require_train="${1:-1}"
     local require_val="${2:-1}"
     local require_model="${3:-1}"
+    local allow_external_ray="${4:-0}"
     local_validate_number GPUS "$LOCAL_GPUS"
     local_validate_number NODES "$LOCAL_NODES"
-    [[ "$LOCAL_NODES" == 1 ]] || local_die "NODES must be 1 for the single-machine launcher"
+    if [[ "$LOCAL_NODES" != 1 ]]; then
+        [[ "$allow_external_ray" == 1 && "${RAY_ADDRESS:-}" =~ ^[^[:space:]/:]+:[1-9][0-9]*$ ]] ||
+            local_die "NODES > 1 requires an external-Ray-capable launcher and explicit RAY_ADDRESS=host:port"
+    fi
     command -v "$LOCAL_PYTHON_BIN" >/dev/null 2>&1 || local_die "Python executable not found: $LOCAL_PYTHON_BIN"
     local_require_local_path output "$LOCAL_OUTPUT_DIR"
     local_require_local_path checkpoint "$LOCAL_CHECKPOINT_DIR"
