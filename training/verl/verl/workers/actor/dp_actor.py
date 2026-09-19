@@ -263,6 +263,8 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._r5_successful_optimizer_steps = 0
+        self._skipped_optimizer_steps = 0
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -1014,7 +1016,6 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
     def _r5_on_successful_step(self, epoch_index, minibatch_index, mini_batch, grad_norm):
-        self._r5_successful_optimizer_steps = int(getattr(self, "_r5_successful_optimizer_steps", 0)) + 1
         sample_ids = _r5_sample_ids(mini_batch) if mini_batch is not None else []
         unique_ids = []
         seen = set()
@@ -1072,12 +1073,14 @@ class DataParallelPPOActor(BasePPOActor):
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
+            self._skipped_optimizer_steps += 1
             if r5_trace_enabled():
                 self._r5_on_skipped_step(epoch_index, minibatch_index, mini_batch, grad_norm)
         else:
             if r5_trace_enabled() and not getattr(self, "_r5_param_before", None):
                 self._r5_param_before = self._r5_snapshot_params()
             self.actor_optimizer.step()
+            self._r5_successful_optimizer_steps += 1
             if r5_trace_enabled():
                 self._r5_on_successful_step(epoch_index, minibatch_index, mini_batch, grad_norm)
         return grad_norm
@@ -1248,6 +1251,8 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        successful_before = self._r5_successful_optimizer_steps
+        skipped_before = self._skipped_optimizer_steps
         for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -1477,4 +1482,12 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        # Each rank executes the same synchronized update. The trainer averages
+        # these scalar lists across ranks; it must not sum them as extra updates.
+        metrics["actor/successful_optimizer_steps"] = [self._r5_successful_optimizer_steps]
+        metrics["actor/successful_optimizer_steps_this_outer"] = [
+            self._r5_successful_optimizer_steps - successful_before
+        ]
+        metrics["actor/skipped_optimizer_steps_this_outer"] = [self._skipped_optimizer_steps - skipped_before]
+        metrics["actor/opd_refresh_enabled"] = [int(self._opd_refresh_advantage)]
         return metrics

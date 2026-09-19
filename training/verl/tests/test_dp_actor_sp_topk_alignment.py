@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from verl.workers.actor.dp_actor import _align_rmpad_topk_ids_for_ulysses
 
@@ -73,3 +74,33 @@ def test_align_rejects_ambiguous_or_invalid_shapes(topk_ids, kwargs, match):
             sp_size=2,
             sp_rank=kwargs.get("sp_rank", 0),
         )
+
+
+def test_trace_off_counts_real_optimizer_steps_and_nonfinite_skips(monkeypatch):
+    from verl.workers.actor.dp_actor import DataParallelPPOActor
+
+    monkeypatch.setenv("MOPD_R5_TRACE", "0")
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
+    actor.config = SimpleNamespace(grad_clip=1.0)
+    actor.actor_module = torch.nn.Linear(2, 1, bias=False)
+    actor.actor_optimizer = torch.optim.SGD(actor.actor_module.parameters(), lr=0.1)
+    actor._r5_successful_optimizer_steps = 0
+    actor._skipped_optimizer_steps = 0
+
+    def unexpected_trace(*args):
+        raise AssertionError("Trace-off optimizer must not create expensive samples")
+
+    actor._r5_on_successful_step = unexpected_trace
+    actor._r5_on_skipped_step = unexpected_trace
+    before = actor.actor_module.weight.detach().clone()
+    actor.actor_module.weight.grad = torch.ones_like(before)
+    actor._optimizer_step()
+    assert actor._r5_successful_optimizer_steps == 1
+    assert not torch.equal(before, actor.actor_module.weight)
+    after = actor.actor_module.weight.detach().clone()
+    actor.actor_module.weight.grad = torch.full_like(after, float("nan"))
+    actor._optimizer_step()
+    assert actor._r5_successful_optimizer_steps == 1
+    assert actor._skipped_optimizer_steps == 1
+    assert torch.equal(after, actor.actor_module.weight)

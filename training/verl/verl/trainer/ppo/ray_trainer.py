@@ -1992,6 +1992,15 @@ class RayPPOTrainer:
                             batch.meta_info["teacher_temperature"] = teacher_temperature
                             batch.meta_info["reward_mode"] = reward_mode
                             batch.meta_info["top_p_intersec_p"] = self.config.actor_rollout_ref.rollout.get("top_p_intersec_p", 0.99)
+
+                            # Capture original candidate IDs before any teacher or learner mutation.
+                            self._dump_data_proto(batch, timing_raw, stage="pre_teacher")
+                            dump_config = self._data_proto_dump_config()
+                            if dump_config and dump_config.get("stop_after_dump", False):
+                                if not self._should_dump_data_proto("pre_teacher") or not dump_config.get("fail_on_error", False):
+                                    raise ValueError("Acquisition-only execution requires a successful pre_teacher dump")
+                                print("Acquisition-only complete: original student support saved; optimizer updates=0")
+                                return
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
