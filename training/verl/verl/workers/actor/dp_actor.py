@@ -265,6 +265,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
         self._r5_successful_optimizer_steps = 0
         self._skipped_optimizer_steps = 0
+        self._r5_support_outer_captured = False
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -967,6 +968,42 @@ class DataParallelPPOActor(BasePPOActor):
             path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
         self._r5_learner_batch_dumped = True
 
+    def _r5_trace_fixed_support(self, micro_batch, candidate_ids, current_log_probs,
+                              advantage_before_domain_weight, advantage_for_loss,
+                              epoch_index, minibatch_index):
+        """Record bounded, same-row evidence from the actual learner operands."""
+        batch = micro_batch.batch
+        valid = batch["response_mask"][0].nonzero(as_tuple=True)[0]
+        positions = valid[[0, len(valid) // 2, -1]].unique() if len(valid) else valid
+
+        def sample(tensor):
+            return tensor[0, positions].detach().float().cpu().tolist()
+
+        self._r5_append_jsonl({
+            "event": "learner_fixed_support",
+            "epoch": epoch_index,
+            "minibatch_index": minibatch_index,
+            "microbatch_index": 0,
+            "successful_optimizer_steps_before": self._r5_successful_optimizer_steps,
+            "sample_id": _r5_sample_ids(micro_batch)[0],
+            "data_source": micro_batch.non_tensor_batch.get("data_source", [None])[0],
+            "response_positions": positions.cpu().tolist(),
+            "response_ids": batch["responses"][0, positions].cpu().tolist(),
+            "response_mask": batch["response_mask"][0, positions].cpu().tolist(),
+            "student_top_k_ids": candidate_ids[0, positions].cpu().tolist(),
+            "old_student_top_k_log_probs": sample(batch["student_top_k_log_probs"]),
+            "current_student_top_k_log_probs": sample(current_log_probs),
+            "teacher_on_student_log_probs": sample(batch["teacher_on_student_log_probs"])
+            if "teacher_on_student_log_probs" in batch else None,
+            "stored_advantage": sample(batch["advantages"]),
+            "advantage_before_domain_weight": sample(advantage_before_domain_weight),
+            "advantage_for_loss": sample(advantage_for_loss),
+            "domain_loss_weight": float(batch["domain_loss_weight"][0].detach().cpu())
+            if "domain_loss_weight" in batch else 1.0,
+            "opd_refresh_advantage": self._opd_refresh_advantage,
+            "reward_weight_mode": self._opd_reward_weight_mode,
+        })
+
     def _r5_write_param_delta(self):
         if getattr(self, "_r5_param_delta_written", False) or not _r5_is_rank0():
             return
@@ -1046,13 +1083,6 @@ class DataParallelPPOActor(BasePPOActor):
                 payload["old_topk_logp_sha256"] = _r5_tensor_sha256(batch["student_top_k_log_probs"])
             if "teacher_on_student_log_probs" in batch.keys():
                 payload["teacher_q_sha256"] = _r5_tensor_sha256(batch["teacher_on_student_log_probs"])
-        if getattr(self, "_r5_last_current_topk_sha", None):
-            payload["current_topk_logp_sha256"] = self._r5_last_current_topk_sha
-            payload["refresh_a_sha256"] = self._r5_last_refresh_a_sha
-            payload["stale_a_sha256"] = self._r5_last_stale_a_sha
-            payload["stale_equals_refresh"] = self._r5_last_refresh_a_sha == self._r5_last_stale_a_sha
-            if getattr(self, "_r5_last_teacher_q_sha", None):
-                payload["teacher_q_sha256"] = self._r5_last_teacher_q_sha
         self._r5_append_jsonl(payload)
         self._r5_write_param_delta()
 
@@ -1253,6 +1283,7 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         successful_before = self._r5_successful_optimizer_steps
         skipped_before = self._skipped_optimizer_steps
+        trace_support = r5_trace_enabled() and not self._r5_support_outer_captured
         for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -1266,7 +1297,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -1347,23 +1378,6 @@ class DataParallelPPOActor(BasePPOActor):
                                 reward_weight_mode=self._opd_reward_weight_mode,
                             )
                             micro_batch_metrics["mt_opd/m4_advantage_refreshed"] = 1.0
-                            if r5_trace_enabled():
-                                stale = refresh_opd_advantage(
-                                    student_top_k_log_probs=model_inputs["student_top_k_log_probs"],
-                                    teacher_on_student_log_probs=model_inputs[
-                                        "teacher_on_student_log_probs"
-                                    ],
-                                    response_mask=response_mask,
-                                    reward_weight_mode=self._opd_reward_weight_mode,
-                                )
-                                self._r5_last_current_topk_sha = _r5_tensor_sha256(topk_log_probs.detach())
-                                self._r5_last_refresh_a_sha = _r5_tensor_sha256(advantages.detach())
-                                self._r5_last_stale_a_sha = _r5_tensor_sha256(stale.detach())
-                                self._r5_last_teacher_q_sha = _r5_tensor_sha256(
-                                    model_inputs["teacher_on_student_log_probs"]
-                                )
-                                if student_top_k_ids is not None:
-                                    self._r5_last_ids_sha = _r5_tensor_sha256(student_top_k_ids)
 
                     else:
                         _, log_prob, *_ = self._forward_micro_batch(
@@ -1383,10 +1397,16 @@ class DataParallelPPOActor(BasePPOActor):
                     # pg_clipfrac. Scaling it would turn those into domain-weighted
                     # means, and with IF's weight around 37x they would report almost
                     # only IF. The advantage carries the loss and nothing else.
+                    advantage_before_domain_weight = advantages
                     if "domain_loss_weight" in model_inputs:
                         _dw = model_inputs["domain_loss_weight"].to(advantages.dtype)
                         advantages = advantages * _dw.view(
                             -1, *([1] * (advantages.dim() - 1))
+                        )
+                    if trace_support and micro_idx == 0 and advantages.dim() == 3 and "student_top_k_ids" in model_inputs:
+                        self._r5_trace_fixed_support(
+                            micro_batch, student_top_k_ids, topk_log_probs,
+                            advantage_before_domain_weight, advantages, epoch_idx, batch_idx,
                         )
 
                     format_mask = None
@@ -1482,6 +1502,8 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        if trace_support:
+            self._r5_support_outer_captured = True
         # Each rank executes the same synchronized update. The trainer averages
         # these scalar lists across ranks; it must not sum them as extra updates.
         metrics["actor/successful_optimizer_steps"] = [self._r5_successful_optimizer_steps]
