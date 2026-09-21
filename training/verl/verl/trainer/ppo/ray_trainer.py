@@ -1900,7 +1900,16 @@ class RayPPOTrainer:
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                # `stop_after_outer` ends a bounded segment at an absolute outer
+                # while leaving the scientific horizon and the scheduler at
+                # `total_training_steps`. It reuses the normal last-step path, so
+                # the segment ends with the ordinary checkpoint save and a clean
+                # return; it changes no objective, batch, teacher call or sampling
+                # behaviour. Null means run to the horizon, as before.
+                stop_after_outer = self.config.trainer.get("stop_after_outer", None)
+                is_last_step = self.global_steps >= self.total_training_steps or (
+                    stop_after_outer is not None and self.global_steps >= int(stop_after_outer)
+                )
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
